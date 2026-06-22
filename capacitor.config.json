@@ -1,0 +1,41 @@
+{
+    "appId": "com.protik.sbm",
+    "appName": "SBM",
+    "webDir": "dist",
+    "server": {
+        "androidScheme": "https",
+        "cleartext": true,
+        "allowNavigation": [
+            "accounts.google.com",
+            "*.google.com",
+            "*.googleapis.com",
+            "*.firebasedatabase.app",
+            "*.firebaseio.com",
+            "*.firebase.com"
+        ]
+    },
+    "android": {
+        "allowMixedContent": true,
+        "webContentsDebuggingEnabled": false
+    },
+    "plugins": {
+        "SplashScreen": {
+            "launchShowDuration": 0
+        },
+        "StatusBar": {
+            "style": "DARK",
+            "backgroundColor": "#0a1f0d",
+            "overlaysWebView": false,
+            "animated": true
+        },
+        "GoogleAuth": {
+            "scopes": [
+                "profile",
+                "email",
+                "https://www.googleapis.com/auth/drive.file"
+            ],
+            "serverClientId": "822824220691-tk3bhouplkmuur7o4l1jhlqabdtkqs57.apps.googleusercontent.com",
+            "forceCodeForRefreshToken": false
+        }
+    }
+}

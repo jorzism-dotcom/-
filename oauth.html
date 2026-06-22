@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SBM - Google Drive সংযোগ</title>
+<style>
+  body { background: #0a1628; color: #e2e8f0; font-family: sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; text-align: center; }
+  .card { background: #0d1f3c; border: 1px solid #1e3a5f; border-radius: 16px; padding: 32px; max-width: 360px; width: 100%; }
+  .icon { font-size: 48px; margin-bottom: 16px; }
+  h2 { margin: 0 0 8px; font-size: 18px; }
+  p { color: #64748b; font-size: 14px; margin: 8px 0; }
+  .success { color: #22c55e; }
+  .error { color: #ef4444; }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="icon">⏳</div>
+  <h2 id="title">সংযুক্ত হচ্ছে...</h2>
+  <p id="msg">Google Drive access token প্রক্রিয়া করা হচ্ছে</p>
+</div>
+<script>
+(function() {
+  var hash = window.location.hash.slice(1);
+  var params = new URLSearchParams(hash);
+  var token = params.get('access_token');
+  var state = params.get('state');
+  var error = params.get('error');
+
+  var card = document.getElementById('card');
+  var title = document.getElementById('title');
+  var msg = document.getElementById('msg');
+
+  if (error) {
+    card.querySelector('.icon').textContent = '❌';
+    title.textContent = 'সংযোগ বাতিল';
+    title.className = 'error';
+    msg.textContent = error === 'access_denied' ? 'আপনি Google Drive অ্যাক্সেস দিতে অস্বীকার করেছেন।' : 'Error: ' + error;
+    return;
+  }
+
+  if (!token) {
+    card.querySelector('.icon').textContent = '⚠️';
+    title.textContent = 'Token পাওয়া যায়নি';
+    msg.textContent = 'OAuth response-এ access_token নেই।';
+    return;
+  }
+
+  // App.jsx-এর appUrlOpen listener-এর সাথে মিলিয়ে deep link
+  // com.protik.sbm:/oauth2redirect#access_token=...&state=...
+  var deepLink = 'com.protik.sbm:/oauth2redirect#access_token=' + encodeURIComponent(token)
+    + '&state=' + encodeURIComponent(state || '');
+
+  card.querySelector('.icon').innerHTML = '<span class="spin">◌</span>';
+  title.textContent = 'SBM App-এ ফিরে যাচ্ছে...';
+  msg.textContent = 'একটু অপেক্ষা করুন';
+
+  window.location.href = deepLink;
+
+  setTimeout(function() {
+    card.querySelector('.icon').textContent = '✅';
+    title.textContent = 'সংযোগ সফল!';
+    title.className = 'success';
+    msg.textContent = 'SBM App খোলা না গেলে নিচের link-এ tap করুন:';
+    var link = document.createElement('a');
+    link.href = deepLink;
+    link.textContent = '📱 SBM App খুলুন';
+    link.style.cssText = 'display:block;margin-top:16px;padding:12px;background:#4285F4;color:#fff;border-radius:10px;text-decoration:none;font-weight:800;font-size:15px;';
+    card.appendChild(link);
+  }, 2000);
+})();
+</script>
+</body>
+</html>

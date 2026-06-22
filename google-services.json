@@ -1,0 +1,40 @@
+{
+  "project_info": {
+    "project_number": "359825185312",
+    "firebase_url": "https://protik-aa991-default-rtdb.firebaseio.com",
+    "project_id": "protik-aa991",
+    "storage_bucket": "protik-aa991.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:359825185312:android:fe63f36c590539597e7a45",
+        "android_client_info": {
+          "package_name": "com.protik.sbm"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "359825185312-6gif6u0j4ogj38hv5312auq4oh41r0gs.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA--aR8ArMlcaksdfmR7SuIGrPdqNNK2ws"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "359825185312-6gif6u0j4ogj38hv5312auq4oh41r0gs.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
