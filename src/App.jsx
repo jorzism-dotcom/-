@@ -3397,17 +3397,22 @@ const FSS = {
 
   init(cfg) {
     if (!cfg?.projectId) return false;
-    const same = this._cfg && this._cfg.projectId === cfg.projectId
-      && this._cfg.apiKey === cfg.apiKey;
+    // authDomain না থাকলে auto-fill — Firestore write-এর জন্য জরুরি
+    const fullCfg = {
+      ...cfg,
+      authDomain: cfg.authDomain || (cfg.projectId + ".firebaseapp.com"),
+    };
+    const same = this._cfg && this._cfg.projectId === fullCfg.projectId
+      && this._cfg.apiKey === fullCfg.apiKey;
     if (same && this._db) return true;
 
     this.teardown();
     try {
-      const appName = "sbm-firestore-" + cfg.projectId;
+      const appName = "sbm-firestore-" + fullCfg.projectId;
       const existing = getApps().find(a => a.name === appName);
-      this._app = existing || initializeApp(cfg, appName);
+      this._app = existing || initializeApp(fullCfg, appName);
       this._db = getFirestore(this._app);
-      this._cfg = cfg;
+      this._cfg = fullCfg;
       this._connectionState = "online";
       return true;
     } catch (e) {
@@ -17529,7 +17534,7 @@ function Settings_({ T, S, shopName,
   const [showAllLogs, setShowAllLogs] = useState(false);
   // 🔥 Firebase state
   const [showFbSetup, setShowFbSetup] = useState(false);
-  const [fbForm,      setFbForm]      = useState(firebaseConfig || { databaseURL: "", apiKey: "", projectId: "" });
+  const [fbForm,      setFbForm]      = useState(firebaseConfig || { databaseURL: "", apiKey: "", projectId: "", authDomain: "" });
   const [fbTesting,   setFbTesting]   = useState(false);
   const [fbMigrating, setFbMigrating] = useState(false);
   const [fbTestMsg,   setFbTestMsg]   = useState(null);
@@ -18534,6 +18539,12 @@ function Settings_({ T, S, shopName,
             placeholder="your-project-id"
             value={fbForm.projectId || ""}
             onChange={e => setFbForm(f => ({ ...f, projectId: e.target.value.trim() }))} />
+
+          <label style={S.label}>Auth Domain</label>
+          <input style={{ ...S.input, fontFamily:"monospace", fontSize:12 }}
+            placeholder="your-project-id.firebaseapp.com"
+            value={fbForm.authDomain || ""}
+            onChange={e => setFbForm(f => ({ ...f, authDomain: e.target.value.trim() }))} />
 
           {fbTestMsg && (
             <div style={{ background: fbTestMsg.ok ? "#22c55e18" : "#ef444418", color: fbTestMsg.ok ? "#22c55e" : "#ef4444", borderRadius:8, padding:"8px 12px", fontSize:12, marginBottom:8, fontWeight:600 }}>
