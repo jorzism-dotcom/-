@@ -3,7 +3,7 @@ import ReactDOM from "react-dom";
 import { initializeApp, getApps, deleteApp } from "firebase/app";
 import {
   getFirestore, doc, getDoc, updateDoc, setDoc, deleteDoc,
-  collection, onSnapshot as fsOnSnapshot, writeBatch, getDocs
+  collection, onSnapshot, getDocs, enableIndexedDbPersistence,
 } from "firebase/firestore";
 import { create } from "zustand";
 
@@ -71,9 +71,9 @@ const useAppStore = create((set) => ({
   // ── Firebase ─────────────────────────────────────────────────────────────
   firebaseConfig:    null,
   firebaseEnabled:   false,
-  fbStatus:          null,
-  fbBackupList:      [],
   activeDevices:     [],
+  googleDriveToken:  null,   // { token, savedAt } — admin সেট করে, Firestore-এর মাধ্যমে staff ফোনেও sync হয়
+  lastLocalBackup:   null,
 
   // ── AI ────────────────────────────────────────────────────────────────────
   anthropicKey:      "",
@@ -2648,38 +2648,39 @@ function SubscriptionGate({ children }) {
       await setStorage("sbm_phone", usePhone);
 
       // 🔥 ফিক্স: শুধু config+users সেভ করলেই হয় না — customers/products/invoices ইত্যাদি
-      // actual business data ১৫ সেকেন্ড polling এর জন্য অপেক্ষা না করে এখনই টেনে আনি,
-      // যাতে staff device প্রথম ওপেনেই সব data দেখতে পায়।
+      // actual business data রিলোডের পরের রিয়েল-টাইম listener-এর জন্য অপেক্ষা না করে
+      // এখনই Firestore থেকে একবার টেনে আনি, যাতে staff device প্রথম ওপেনেই সব data দেখতে পায়।
       if (data.shopFirebaseConfig) {
         try {
           FB.init(data.shopFirebaseConfig);
-          // প্রথমে Firestore (FSS) থেকে সব collection এক-বারে pull করি — এটাই primary source
-          const fssOk = FSS.init(data.shopFirebaseConfig);
-          if (fssOk) {
-            const fssKeys = ["customers","products","invoices","txns","paymentInvoices",
-                             "purchaseOrders","stockMovements","cashLogs","suppliers","smsLog","users"];
-            for (const key of fssKeys) {
-              try {
-                const arr = await FSS.getAllOnce(key);
-                if (arr && arr.length > 0) await save(SK[key] || ("sbm-" + key), arr);
-              } catch {}
-            }
-          }
-          // Firestore-এ data না থাকলে RTDB snapshot fallback (legacy)
-          const snap = await FB.loadBackup();
-          if (snap?.ok && snap?.data) {
-            const d = snap.data;
-            if (d.customers)       await save(SK.customers, d.customers);
-            if (d.products)        await save(SK.products, d.products);
-            if (d.invoices)        await save(SK.invoices, d.invoices);
-            if (d.txns)            await save(SK.txns, d.txns);
-            if (d.smsLog)          await save(SK.smsLog, d.smsLog);
-            if (d.paymentInvoices) await save(SK.paymentInvoices, d.paymentInvoices);
-            if (d.purchaseOrders)  await save(SK.purchaseOrders, d.purchaseOrders);
-            if (d.stockMovements)  await save(SK.stockMovements, d.stockMovements);
-            if (d.users)           await save(SK.users, d.users); // সর্বশেষ users (permission সহ)
-          }
-        } catch { /* silent — app reload-এর পর Firestore subscribeAll থেকে আসবে */ }
+          FSS.init(data.shopFirebaseConfig);
+          const [
+            customersD, productsD, invoicesD, txnsD, smsLogD,
+            paymentInvoicesD, purchaseOrdersD, stockMovementsD,
+            cashLogsD, suppliersD, usersD, settingsD,
+          ] = await Promise.all([
+            FSS.getCollectionOnce("customers"), FSS.getCollectionOnce("products"),
+            FSS.getCollectionOnce("invoices"),  FSS.getCollectionOnce("txns"),
+            FSS.getCollectionOnce("smsLog"),    FSS.getCollectionOnce("paymentInvoices"),
+            FSS.getCollectionOnce("purchaseOrders"), FSS.getCollectionOnce("stockMovements"),
+            FSS.getCollectionOnce("cashLogs"),  FSS.getCollectionOnce("suppliers"),
+            FSS.getCollectionOnce("users"),     FSS.getSettingsOnce(),
+          ]);
+          if (customersD.length)       await save(SK.customers, customersD);
+          if (productsD.length)        await save(SK.products, productsD);
+          if (invoicesD.length)        await save(SK.invoices, invoicesD);
+          if (txnsD.length)            await save(SK.txns, txnsD);
+          if (smsLogD.length)          await save(SK.smsLog, smsLogD);
+          if (paymentInvoicesD.length) await save(SK.paymentInvoices, paymentInvoicesD);
+          if (purchaseOrdersD.length)  await save(SK.purchaseOrders, purchaseOrdersD);
+          if (stockMovementsD.length)  await save(SK.stockMovements, stockMovementsD);
+          if (cashLogsD.length)        await save(SK.cashLogs, cashLogsD);
+          if (suppliersD.length)       await save(SK.suppliers, suppliersD);
+          if (usersD.length)           await save(SK.users, usersD); // সর্বশেষ users (permission সহ)
+          if (settingsD?.shopName)     await save(SK.shopName, settingsD.shopName);
+          if (settingsD?.smsTemplates) await save(SK.smsTemplates, settingsD.smsTemplates);
+          if (settingsD?.smsGateway)   await save(SK.smsGateway, settingsD.smsGateway);
+        } catch { /* silent — রিলোডের পর রিয়েল-টাইম listener এমনিতেই চেষ্টা করবে */ }
       }
 
       setRestoreMsg("✅ ডেটা ফিরে পাওয়া গেছে! অ্যাপ রিলোড হচ্ছে...");
@@ -3272,8 +3273,41 @@ const FS = {
       return { ok: true, msg: "📥 ডাউনলোড হচ্ছে..." };
     } catch(e) { return { ok: false, msg: e.message }; }
   },
-  async listBackups() { return []; },
+  // Download/SBM/ ফোল্ডারের সব ব্যাকআপ ফাইলের নাম লিস্ট করে (APK-only — Filesystem plugin লাগে)
+  async listBackups() {
+    try {
+      if (typeof window === "undefined" || !window.Capacitor?.isNativePlatform?.()) return [];
+      const Filesystem = window.Capacitor?.Plugins?.Filesystem;
+      if (!Filesystem) return [];
+      const res = await Filesystem.readdir({ path: "Download/SBM", directory: "EXTERNAL_STORAGE" });
+      return (res?.files || []).map(f => (typeof f === "string" ? f : f.name)).filter(Boolean);
+    } catch { return []; }
+  },
   async readBackup() { return null; },
+
+  // ৭ দিনের বেশি পুরনো sbm-auto-{date}.json ফাইল মুছে দেয় — storage waste আটকাতে
+  async deleteOldBackups(maxAgeDays = 7) {
+    try {
+      if (typeof window === "undefined" || !window.Capacitor?.isNativePlatform?.()) return { ok: true, deleted: 0 };
+      const Filesystem = window.Capacitor?.Plugins?.Filesystem;
+      if (!Filesystem) return { ok: true, deleted: 0 };
+      const files = await this.listBackups();
+      const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+      let deleted = 0;
+      for (const name of files) {
+        const m = name.match(/sbm-auto-(\d{4}-\d{2}-\d{2})\.json$/);
+        if (!m) continue;
+        const fileTime = new Date(m[1] + "T00:00:00").getTime();
+        if (!isNaN(fileTime) && fileTime < cutoff) {
+          try {
+            await Filesystem.deleteFile({ path: "Download/SBM/" + name, directory: "EXTERNAL_STORAGE" });
+            deleted++;
+          } catch {}
+        }
+      }
+      return { ok: true, deleted };
+    } catch (e) { return { ok: false, msg: e.message, deleted: 0 }; }
+  },
 };
 
 const Haptic = {
@@ -3312,6 +3346,9 @@ const DEV_CONTACT = {
 };
 // Master Code "169133" এর SHA-256 hash
 const DEV_MASTER_HASH = "ef920d5cd2e23582ee35e6b1c9b18f9f94f5f88f3d5d03b422137208ce4ecc0b";
+
+// SBM Backup project — Google OAuth Web Client ID (Drive auto-backup)
+const GOOGLE_WEB_CLIENT_ID = "822824220691-tk3bhouplkmuur7o4l1jhlqabdtkqs57.apps.googleusercontent.com";
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 const SK = {
@@ -3373,50 +3410,50 @@ const DeviceID = (() => {
   };
 })();
 
-// ─── FSS — Firestore Per-Record Sync Layer (replaces RT) ────────────────────
-// প্রতিটি collection-এর প্রতিটি document আলাদাভাবে sync হয় (onSnapshot)।
-// যেকোনো ফোন থেকে change হলে millisecond-এর মধ্যে সব ফোনে (admin+staff) পৌঁছায়।
-// Collections: customers, products, invoices, txns, paymentInvoices,
-// purchaseOrders, stockMovements, cashLogs, suppliers, smsLog, users
-// + settings/main (shopName, smsTemplates, smsGateway)
-const FSS_KEYS = [
-  "customers", "products", "invoices", "txns", "paymentInvoices",
-  "purchaseOrders", "stockMovements", "cashLogs", "suppliers",
-  "smsLog", "users",
+// ─── FSS — Firestore Per-Record Sync Layer (replaces RT/RTDB array-sync) ────
+// প্রতিটা collection-এর প্রতিটা ডকুমেন্ট আলাদাভাবে sync হয় (record-level) —
+// সম্পূর্ণ array কখনো ওভাররাইট হয় না। তাই দুই ফোন একই সময়ে আলাদা রেকর্ড
+// বদলালেও কোনো conflict/data-loss/mismatch হয় না। Firestore SDK-এর built-in
+// IndexedDB persistence থাকায় নেট না থাকলেও লোকালে কাজ করে, নেট ফিরলে
+// নিজে থেকেই sync হয়ে যায় — কোনো polling বা manual reseed লাগে না।
+// Collections: customers, products, invoices, txns, smsLog, users, suppliers,
+// purchaseOrders, stockMovements, cashLogs, paymentInvoices + settings/main
+// (shopName, smsTemplates, smsGateway)
+const FSS_COLLECTIONS = [
+  "customers", "products", "invoices", "txns", "smsLog", "users", "suppliers",
+  "purchaseOrders", "stockMovements", "cashLogs", "paymentInvoices",
 ];
 
 const FSS = {
   _app: null,
   _db: null,
   _cfg: null,
-  _listeners: {},        // key -> unsubscribe fn
-  _settingsListener: null,
-  _connectionState: "offline",
+  _unsubs: {},
+  _persistTried: false,
 
   isReady() { return !!this._db; },
 
+  // (Re)initialise the Firestore app for a given shop config. Safe to call
+  // repeatedly — if config unchanged, no-op; if changed, tears down first.
   init(cfg) {
     if (!cfg?.projectId) return false;
-    // authDomain না থাকলে auto-fill — Firestore write-এর জন্য জরুরি
-    const fullCfg = {
-      ...cfg,
-      authDomain: cfg.authDomain || (cfg.projectId + ".firebaseapp.com"),
-    };
-    const same = this._cfg && this._cfg.projectId === fullCfg.projectId
-      && this._cfg.apiKey === fullCfg.apiKey;
+    const same = this._cfg && this._cfg.projectId === cfg.projectId && this._cfg.apiKey === cfg.apiKey;
     if (same && this._db) return true;
-
     this.teardown();
     try {
-      const appName = "sbm-firestore-" + fullCfg.projectId;
+      // shop-ভিত্তিক named app — protik-aa991 (central recovery)-এর default
+      // Firestore app-এর সাথে কখনো কলিশন করবে না
+      const appName = "sbm-fss-" + (cfg.projectId || "default");
       const existing = getApps().find(a => a.name === appName);
-      this._app = existing || initializeApp(fullCfg, appName);
+      this._app = existing || initializeApp(cfg, appName);
       this._db = getFirestore(this._app);
-      this._cfg = fullCfg;
-      this._connectionState = "online";
+      if (!this._persistTried) {
+        this._persistTried = true;
+        try { enableIndexedDbPersistence(this._db).catch(() => {}); } catch {}
+      }
+      this._cfg = cfg;
       return true;
     } catch (e) {
-      this._connectionState = "offline";
       this._db = null;
       return false;
     }
@@ -3424,225 +3461,235 @@ const FSS = {
 
   teardown() {
     this.unsubscribeAll();
-    if (this._settingsListener) { this._settingsListener(); this._settingsListener = null; }
-    if (this._app) {
-      try { deleteApp(this._app); } catch {}
-    }
+    if (this._app) { try { deleteApp(this._app); } catch {} }
     this._app = null;
     this._db = null;
     this._cfg = null;
   },
 
-  // Subscribe to one collection. callback(array) fires with the full current
-  // array on every change (own writes included — Firestore local cache
-  // applies instantly, so this also gives optimistic-UI for free).
-  subscribe(key, callback) {
+  // একটা collection-এর সব ডকুমেন্ট রিয়েল-টাইমে শোনে — যেকোনো ফোনে কোনো রেকর্ড
+  // change হলেই (millisecond-এ) callback(array) ফায়ার করে।
+  subscribeCollection(name, callback) {
     if (!this._db) return () => {};
-    this.unsubscribe(key);
-    const colRef = collection(this._db, key);
-    const unsub = fsOnSnapshot(colRef, (snap) => {
+    this.unsubscribe(name);
+    const colRef = collection(this._db, name);
+    const unsub = onSnapshot(colRef, (snap) => {
       const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      this._connectionState = "online";
       callback(arr);
-    }, (err) => {
-      this._connectionState = "offline";
-    });
-    this._listeners[key] = unsub;
+    }, () => { /* offline/error — Firestore নিজেই retry করবে, cache থেকে কাজ চলবে */ });
+    this._unsubs[name] = unsub;
     return unsub;
-  },
-
-  unsubscribe(key) {
-    if (this._listeners[key]) { this._listeners[key](); delete this._listeners[key]; }
-  },
-
-  unsubscribeAll() {
-    Object.keys(this._listeners).forEach(k => this.unsubscribe(k));
-  },
-
-  subscribeAll(onChange) {
-    FSS_KEYS.forEach(key => this.subscribe(key, (arr) => onChange(key, arr)));
   },
 
   subscribeSettings(callback) {
     if (!this._db) return () => {};
-    if (this._settingsListener) this._settingsListener();
+    this.unsubscribe("__settings");
     const ref = doc(this._db, "settings", "main");
-    this._settingsListener = fsOnSnapshot(ref, (snap) => {
-      this._connectionState = "online";
-      callback(snap.exists() ? snap.data() : {});
-    }, () => { this._connectionState = "offline"; });
-    return this._settingsListener;
+    const unsub = onSnapshot(ref, (snap) => callback(snap.exists() ? snap.data() : null), () => {});
+    this._unsubs["__settings"] = unsub;
+    return unsub;
   },
 
-  // Write/update one record. `data` must include `id` matching the doc id
-  // (caller's record id), or pass id separately.
-  async setRecord(key, id, data) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
+  unsubscribe(name) { if (this._unsubs[name]) { this._unsubs[name](); delete this._unsubs[name]; } },
+  unsubscribeAll() { Object.keys(this._unsubs).forEach(k => this.unsubscribe(k)); },
+
+  // একটা রেকর্ড লেখো/আপডেট করো (write পরিবর্তন: setDoc = add/update)
+  async setRecord(coll, id, data) {
+    if (!this._db || id === undefined || id === null || id === "") return { ok: false, msg: "Firestore সংযুক্ত নেই" };
     try {
-      await setDoc(doc(this._db, key, String(id)), data);
-      this._connectionState = "online";
+      await setDoc(doc(this._db, coll, String(id)), data);
       return { ok: true };
     } catch (e) {
-      this._connectionState = "offline";
       return { ok: false, msg: e.message || "Firestore write ব্যর্থ" };
     }
   },
 
-  async deleteRecord(key, id) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
+  // রেকর্ড মুছে ফেলো (write পরিবর্তন: deleteDoc = delete)
+  async deleteRecord(coll, id) {
+    if (!this._db || id === undefined || id === null || id === "") return { ok: false, msg: "Firestore সংযুক্ত নেই" };
     try {
-      await deleteDoc(doc(this._db, key, String(id)));
+      await deleteDoc(doc(this._db, coll, String(id)));
       return { ok: true };
     } catch (e) {
       return { ok: false, msg: e.message || "Firestore delete ব্যর্থ" };
     }
   },
 
-  async setSettings(data) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
+  async setSettings(partial) {
+    if (!this._db) return { ok: false, msg: "Firestore সংযুক্ত নেই" };
     try {
-      await setDoc(doc(this._db, "settings", "main"), data, { merge: true });
+      await setDoc(doc(this._db, "settings", "main"), partial, { merge: true });
       return { ok: true };
     } catch (e) {
       return { ok: false, msg: e.message || "Firestore write ব্যর্থ" };
     }
   },
 
-  // Batched write of many records to one collection (≤500 per batch).
-  // Used for: one-time migration/seeding from old RTDB/local arrays.
-  async setMany(key, records) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
-    if (!records?.length) return { ok: true };
+  async getSettingsOnce() {
+    if (!this._db) return null;
     try {
-      for (let i = 0; i < records.length; i += 450) {
-        const slice = records.slice(i, i + 450);
-        const batch = writeBatch(this._db);
-        slice.forEach(rec => {
-          if (rec?.id === undefined || rec?.id === null) return;
-          batch.set(doc(this._db, key, String(rec.id)), rec);
-        });
-        await batch.commit();
-      }
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, msg: e.message || "Firestore batch write ব্যর্থ" };
-    }
+      const s = await getDoc(doc(this._db, "settings", "main"));
+      return s.exists() ? s.data() : null;
+    } catch { return null; }
   },
 
-  // Wipe an entire collection (used by Master Full Reset).
-  async clearCollection(key) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
-    try {
-      const snap = await getDocs(collection(this._db, key));
-      const ids = snap.docs.map(d => d.id);
-      for (let i = 0; i < ids.length; i += 450) {
-        const slice = ids.slice(i, i + 450);
-        const batch = writeBatch(this._db);
-        slice.forEach(id => batch.delete(doc(this._db, key, id)));
-        await batch.commit();
-      }
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, msg: e.message || "Firestore clear ব্যর্থ" };
-    }
-  },
-
-  // Wipe everything (all FSS_KEYS collections + settings/main).
-  async clearAllData() {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
-    try {
-      for (const key of FSS_KEYS) {
-        const r = await this.clearCollection(key);
-        if (!r.ok) return r;
-      }
-      await deleteDoc(doc(this._db, "settings", "main")).catch(() => {});
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, msg: e.message || "Firestore clear ব্যর্থ" };
-    }
-  },
-
-  // One-time fetch of a whole collection (used for migration checks).
-  async getAllOnce(key) {
+  async getCollectionOnce(name) {
     if (!this._db) return [];
     try {
-      const snap = await getDocs(collection(this._db, key));
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const s = await getDocs(collection(this._db, name));
+      return s.docs.map(d => ({ id: d.id, ...d.data() }));
     } catch { return []; }
   },
 
-  // পুরনো sync data মুছে এই ডিভাইসের বর্তমান data দিয়ে নতুন করে শুরু —
-  // Settings-এর "Reset Sync" বাটনে ব্যবহৃত।
-  async purgeAndReseed(localData) {
-    if (!this._db) return { ok: false, msg: "Firebase সংযুক্ত নেই" };
+  // Quick connectivity test — শুধু settings ডকুমেন্ট পড়ার চেষ্টা করে (rules
+  // খোলা থাকলে এম্পটি ডকুমেন্টেও সফল রেসপন্স আসবে)
+  async testConnection(cfg) {
+    const ok = this.init(cfg);
+    if (!ok) return { ok: false, msg: "Project ID / API Key সঠিক না" };
     try {
-      const clr = await this.clearAllData();
-      if (!clr.ok) return clr;
-      const { shopName, smsTemplates, smsGateway, ...rest } = localData || {};
-      for (const key of Object.keys(rest)) {
-        if (FSS_KEYS.includes(key) && Array.isArray(rest[key])) {
-          const r = await this.setMany(key, rest[key]);
-          if (!r.ok) return r;
-        }
-      }
-      await this.setSettings({ shopName, smsTemplates, smsGateway });
-      return { ok: true };
+      await getDoc(doc(this._db, "settings", "main"));
+      return { ok: true, msg: "🎉 Firestore সংযোগ সফল! প্রস্তুত।" };
     } catch (e) {
-      return { ok: false, msg: e.message || "Reseed ব্যর্থ" };
+      const msg = (e?.message || "").includes("permission")
+        ? "❌ অ্যাক্সেস নেই — Firestore Rules চেক করুন (allow read, write: true)"
+        : `❌ সংযোগ ব্যর্থ: ${e.message || "অজানা সমস্যা"}`;
+      return { ok: false, msg };
     }
   },
 
-  getConnectionState() { return this._connectionState; },
+  // 🗑️ Firestore-এর সব ব্যবসায়িক ডেটা (সব collection + settings) মুছে শূন্য থেকে শুরু
+  async clearAllData() {
+    if (!this._db) return { ok: false, msg: "Firestore সংযুক্ত নেই" };
+    try {
+      for (const coll of FSS_COLLECTIONS) {
+        const snap = await getDocs(collection(this._db, coll));
+        await Promise.all(snap.docs.map(d => deleteDoc(d.ref)));
+      }
+      try { await deleteDoc(doc(this._db, "settings", "main")); } catch {}
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, msg: e.message || "Firestore clear ব্যর্থ" };
+    }
+  },
 };
 
-// ─── Firebase Realtime Database Layer (Legacy REST — backup/restore/devices) ─
-// Uses Firebase REST API — no SDK, works in any browser/WebView
-// Rules must be: { "rules": { ".read": true, ".write": true } }
-// Multi-device: up to 5 devices can sync simultaneously via Firebase
-// NOTE: live multi-device data sync now goes through FSS (Firestore, above)
-// using onSnapshot per-record listeners. FB below is kept for manual JSON
-// backup/restore, snapshot history list, and device presence tracking in Settings.
+
+// ─── useFSSCollection — local array state ↔ Firestore collection (record-level) ─
+// লোকাল array বদলালে শুধু বদলানো রেকর্ড(গুলো) Firestore-এ লেখে (debounce 300ms;
+// users-এর জন্য instant/0ms — permission যেন দেরি না হয়)। Firestore থেকে
+// remote change এলে লোকাল array পুরো রিবিল্ড করে বসায়, কিন্তু নিজের সদ্য-করা
+// পরিবর্তন push effect আবার re-push করে না (lastSynced ref দিয়ে echo-guard) —
+// তাই কখনো conflict/mismatch হয় না, আর নেট না থাকলে Firestore-এর built-in
+// cache দিয়ে local-এ কাজ করে, নেট ফিরলে নিজেই sync হয়।
+function useFSSCollection(name, value, setValue, ready, opts = {}) {
+  const { instant = false, filterIncoming = null, onSync = null } = opts;
+  const lastSynced  = useRef(null);
+  const firstRemote = useRef(false);
+  const valueRef    = useRef(value);
+  useEffect(() => { valueRef.current = value; }, [value]);
+
+  // remote → local
+  useEffect(() => {
+    if (!ready) { firstRemote.current = false; return; }
+    firstRemote.current = false;
+    const unsub = FSS.subscribeCollection(name, (arr) => {
+      const incoming = filterIncoming ? filterIncoming(arr) : arr;
+      if (!firstRemote.current) {
+        firstRemote.current = true;
+        if (arr.length === 0 && valueRef.current?.length) {
+          // নতুন/খালি collection — এই ডিভাইসের বর্তমান data দিয়ে seed করি
+          lastSynced.current = valueRef.current;
+          valueRef.current.forEach(rec => { if (rec?.id != null) FSS.setRecord(name, rec.id, rec); });
+          return;
+        }
+      }
+      lastSynced.current = incoming;
+      setValue(incoming);
+      if (onSync) { onSync("syncing"); setTimeout(() => onSync("synced"), 0); setTimeout(() => onSync(null), 1500); }
+    });
+    return () => { FSS.unsubscribe(name); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  // local → remote (diff by id, push শুধু বদলানো/নতুন/মুছা রেকর্ড)
+  useEffect(() => {
+    if (!ready || !firstRemote.current) return;
+    const prevArr = lastSynced.current || [];
+    const prevMap = new Map(prevArr.map(r => [String(r.id), r]));
+    const nextMap = new Map((value || []).map(r => [String(r.id), r]));
+    const run = () => {
+      nextMap.forEach((rec, id) => {
+        const old = prevMap.get(id);
+        if (!old || JSON.stringify(old) !== JSON.stringify(rec)) FSS.setRecord(name, id, rec);
+      });
+      prevMap.forEach((rec, id) => { if (!nextMap.has(id)) FSS.deleteRecord(name, id); });
+      lastSynced.current = value;
+    };
+    if (instant) { run(); return; }
+    const t = setTimeout(run, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, ready]);
+}
+
+// ─── useFSSSettings — shopName/smsTemplates/smsGateway ↔ firestore/settings/main ─
+function useFSSSettings(ready, shopName, setShopName, smsTemplates, setSmsTemplates, smsGateway, setSmsGateway, googleDriveToken, setGoogleDriveToken) {
+  const lastSynced  = useRef(null);
+  const firstRemote = useRef(false);
+  const localRef    = useRef({ shopName, smsTemplates, smsGateway, googleDriveToken });
+  useEffect(() => { localRef.current = { shopName, smsTemplates, smsGateway, googleDriveToken }; }, [shopName, smsTemplates, smsGateway, googleDriveToken]);
+
+  useEffect(() => {
+    if (!ready) { firstRemote.current = false; return; }
+    firstRemote.current = false;
+    const unsub = FSS.subscribeSettings((data) => {
+      if (!firstRemote.current) {
+        firstRemote.current = true;
+        if (!data) {
+          lastSynced.current = { ...localRef.current };
+          FSS.setSettings(localRef.current);
+          return;
+        }
+      }
+      lastSynced.current = data;
+      if (data.shopName !== undefined) setShopName(data.shopName);
+      if (data.smsTemplates !== undefined) setSmsTemplates(data.smsTemplates);
+      if (data.smsGateway !== undefined) setSmsGateway(data.smsGateway);
+      if (data.googleDriveToken !== undefined) setGoogleDriveToken?.(data.googleDriveToken);
+    });
+    return () => FSS.unsubscribe("__settings");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  useEffect(() => {
+    if (!ready || !firstRemote.current) return;
+    const next = { shopName, smsTemplates, smsGateway, googleDriveToken };
+    const t = setTimeout(() => {
+      const prev = lastSynced.current || {};
+      const diff = {};
+      if (JSON.stringify(prev.shopName) !== JSON.stringify(next.shopName)) diff.shopName = next.shopName;
+      if (JSON.stringify(prev.smsTemplates) !== JSON.stringify(next.smsTemplates)) diff.smsTemplates = next.smsTemplates;
+      if (JSON.stringify(prev.smsGateway) !== JSON.stringify(next.smsGateway)) diff.smsGateway = next.smsGateway;
+      if (JSON.stringify(prev.googleDriveToken) !== JSON.stringify(next.googleDriveToken)) diff.googleDriveToken = next.googleDriveToken;
+      if (Object.keys(diff).length) { FSS.setSettings(diff); lastSynced.current = next; }
+    }, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shopName, smsTemplates, smsGateway, googleDriveToken, ready]);
+}
+
+// ─── Firebase Realtime Database Layer (Legacy REST — device presence only) ──
+// ব্যবসায়িক ডেটা সিঙ্ক এখন সম্পূর্ণভাবে FSS (Firestore, উপরে) দিয়ে হয়।
+// FB নিচে শুধু multi-device presence tracking (Settings-এ active devices
+// লিস্ট)-এর জন্য রাখা হয়েছে — RTDB-এর হালকা REST API ব্যবহার করে।
 const FB = {
   _cfg: null,
-  _pollTimer: null,
-  _lastSyncAt: null,
   init(cfg) { this._cfg = cfg; },
 
   _url(path) {
     if (!this._cfg?.databaseURL) return null;
     const base = this._cfg.databaseURL.replace(/\/$/, "");
     return `${base}/${path}.json`;
-  },
-
-  // Compress large data by keeping only essentials for backup
-  _compressBackup(data) {
-    // Store only the arrays needed for restore — skip meta/version overhead
-    return {
-      c:  data.customers       || [],   // customers
-      p:  data.products        || [],   // products
-      i:  data.invoices        || [],   // invoices
-      t:  data.txns            || [],   // transactions
-      s:  data.smsLog          || [],   // sms log
-      pi: data.paymentInvoices || [],   // payment invoices
-      u:  data.users           || [],   // staff/admin users + permissions
-      po: data.purchaseOrders  || [],   // purchase orders
-      sm: data.stockMovements  || [],   // stock movements
-      at: data.exportedAt,
-      v:  "v12"
-    };
-  },
-  _decompressBackup(d) {
-    if (!d) return null;
-    // Handle both compressed (v11/v12) and legacy full format
-    if (d.c !== undefined) {
-      return {
-        customers: d.c, products: d.p, invoices: d.i,
-        txns: d.t, smsLog: d.s, paymentInvoices: d.pi,
-        users: d.u || [], purchaseOrders: d.po || [], stockMovements: d.sm || [],
-        exportedAt: d.at, version: d.v
-      };
-    }
-    return d; // legacy full format
   },
 
   async get(path) {
@@ -3655,220 +3702,12 @@ const FB = {
     } catch { return null; }
   },
 
-  // ── Chunked PUT helper ─────────────────────────────────────────────────────
-  // Firebase RTDB REST limit: ~10MB per node, but safe per-request = 900KB.
-  // For large arrays (invoices, txns) we split into numbered sub-nodes and
-  // write a manifest so the reader can reassemble them.
-  //
-  //  sbm/bk/<key>          → manifest  { _chunked: true, total: N, at, v }
-  //  sbm/bk/<key>_c0       → chunk 0 data
-  //  sbm/bk/<key>_c1       → chunk 1 data …
-  //
-  CHUNK_SAFE_BYTES: 800_000,   // 800 KB — comfortable margin under 900 KB
-
-  async _putRaw(path, body) {
-    const url = this._url(path); if (!url) return { ok: false, msg: "URL নেই" };
-    try {
-      const r = await fetch(url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body
-      });
-      if (r.ok) return { ok: true };
-      const txt = await r.text();
-      if (r.status === 403) {
-        if (txt.includes("host") || txt.includes("allowlist"))
-          return { ok: false, msg: "Rules বন্ধ: Firebase Console → Realtime Database → Rules → .read/.write: true করুন" };
-        return { ok: false, msg: `অ্যাক্সেস নেই (403): Rules চেক করুন` };
-      }
-      return { ok: false, msg: `HTTP ${r.status}: ${txt.slice(0, 60)}` };
-    } catch(e) {
-      return { ok: false, msg: `নেটওয়ার্ক সমস্যা: ${e.message}` };
-    }
-  },
-
-  async set(path, data) {
-    const body = JSON.stringify(data);
-
-    // ── Fast path: fits in one request ──────────────────────────────────────
-    if (body.length <= this.CHUNK_SAFE_BYTES) {
-      return this._putRaw(path, body);
-    }
-
-    // ── Slow path: split into chunks ─────────────────────────────────────────
-    // Split the serialised string into CHUNK_SAFE_BYTES-sized pieces.
-    // Each chunk is stored as a plain string under <path>_cN.
-    // A manifest node at <path> tells loadBackup how many chunks to fetch.
-    const chunks = [];
-    for (let i = 0; i < body.length; i += this.CHUNK_SAFE_BYTES) {
-      chunks.push(body.slice(i, i + this.CHUNK_SAFE_BYTES));
-    }
-
-    // Write all chunk nodes (can be parallelised safely — different paths)
-    const writes = await Promise.all(
-      chunks.map((chunk, idx) =>
-        this._putRaw(`${path}_c${idx}`, JSON.stringify(chunk))
-      )
-    );
-    const failed = writes.find(w => !w.ok);
-    if (failed) return failed;
-
-    // Write manifest last — readers check for _chunked flag
-    const manifestResult = await this._putRaw(path, JSON.stringify({
-      _chunked: true,
-      total: chunks.length,
-      bytes: body.length,
-      at: new Date().toISOString(),
-    }));
-    if (!manifestResult.ok) return manifestResult;
-
-    return { ok: true, chunked: true, chunks: chunks.length, bytes: body.length };
-  },
-
   async delete(path) {
     const url = this._url(path); if (!url) return;
     try { await fetch(url, { method: "DELETE" }); } catch {}
   },
 
-  // 🗑️ Master Delete — Firebase-এ রাখা সব ব্যাকআপ snapshot (৩টি rotating slot +
-  // manifest + legacy path) স্থায়ীভাবে মুছে দেয়। লাইভ ডেটা (sbm/data/*) স্পর্শ করে না।
-  async deleteAllBackups() {
-    try {
-      await Promise.all([
-        this.delete("sbm/snaps/manifest"),
-        this.delete("sbm/snaps/s1"),
-        this.delete("sbm/snaps/s2"),
-        this.delete("sbm/snaps/s3"),
-        this.delete("sbm/idx"),      // legacy index
-        this.delete("sbm/bk"),       // legacy single backup node
-      ]);
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, msg: e.message };
-    }
-  },
-
-  // ── Rolling Snapshot System ────────────────────────────────────────────────
-  // Firebase paths:
-  //   sbm/snaps/manifest   → { cur: 1, slots: { 1: {at,meta,label}, 2: {...}, 3: {...} } }
-  //   sbm/snaps/s1         → compressed data (slot 1)
-  //   sbm/snaps/s2         → compressed data (slot 2)
-  //   sbm/snaps/s3         → compressed data (slot 3)
-  //
-  // Rotation: cur cycles 1→2→3→1. Oldest slot is always overwritten.
-  // Legacy path sbm/idx + sbm/bk/* still readable for backward compat.
-  SNAP_SLOTS: 3,
-
-  async saveBackup(data, filename, label = null) {
-    const ts = new Date().toISOString();
-    const meta = {
-      c: (data.customers||[]).length,
-      i: (data.invoices||[]).length,
-      t: (data.txns||[]).length,
-      p: (data.products||[]).length,
-    };
-
-    // 1. Read current manifest (create fresh if missing)
-    const manifest = (await this.get("sbm/snaps/manifest")) || { cur: 0, slots: {} };
-    const nextSlot = (manifest.cur % this.SNAP_SLOTS) + 1; // 1,2,3,1,2,3...
-
-    // 2. Write compressed data into the next slot
-    const compressed = this._compressBackup(data);
-    const dataResult = await this.set(`sbm/snaps/s${nextSlot}`, compressed);
-    if (!dataResult.ok) return dataResult;
-
-    // 3. Update manifest atomically
-    const newManifest = {
-      cur: nextSlot,
-      slots: {
-        ...manifest.slots,
-        [nextSlot]: {
-          at: ts,
-          fn: filename || "backup",
-          label: label || `স্ন্যাপশট ${nextSlot}`,
-          meta,
-          chunked: !!(dataResult.chunked),
-        },
-      },
-    };
-    const mResult = await this.set("sbm/snaps/manifest", newManifest);
-    if (!mResult.ok) return mResult;
-
-    return { ok: true, slot: nextSlot, at: ts, meta };
-  },
-
-  // Load a specific snapshot slot (default: latest)
-  async loadBackup(slot = null) {
-    const manifest = await this.get("sbm/snaps/manifest");
-
-    // ── New rolling snapshot system ─────────────────────────────────────────
-    if (manifest?.cur) {
-      const targetSlot = slot || manifest.cur;
-      const slotInfo   = manifest.slots?.[targetSlot];
-      if (!slotInfo) return { ok: false, msg: `স্লট ${targetSlot} পাওয়া যায়নি` };
-
-      const raw = await this.get(`sbm/snaps/s${targetSlot}`);
-      if (!raw) return { ok: false, msg: `স্লট ${targetSlot}-এ ডেটা নেই` };
-
-      // Handle chunked slot data
-      if (raw._chunked) {
-        const { total } = raw;
-        const chunkResults = await Promise.all(
-          Array.from({ length: total }, (_, i) => this.get(`sbm/snaps/s${targetSlot}_c${i}`))
-        );
-        if (chunkResults.some(c => c === null)) {
-          return { ok: false, msg: `চাংক পাওয়া যায়নি` };
-        }
-        try {
-          const fullJson = chunkResults.join("");
-          const parsed = JSON.parse(fullJson);
-          return { ok: true, data: this._decompressBackup(parsed), slot: targetSlot, at: slotInfo.at };
-        } catch(e) {
-          return { ok: false, msg: `Parse ব্যর্থ: ${e.message}` };
-        }
-      }
-      return { ok: true, data: this._decompressBackup(raw), slot: targetSlot, at: slotInfo.at };
-    }
-
-    // ── Legacy fallback: old sbm/idx + sbm/bk/* path ────────────────────
-    const idx = await this.get("sbm/idx");
-    if (!idx?.k) return { ok: false, msg: "Firebase-এ কোনো ব্যাকআপ নেই" };
-    const key = idx.k;
-    const legacyData = await this.get(`sbm/bk/${key}`);
-    if (!legacyData) return { ok: false, msg: "ব্যাকআপ ডেটা পাওয়া যায়নি" };
-    if (legacyData._chunked) {
-      const { total } = legacyData;
-      const chunkResults = await Promise.all(
-        Array.from({ length: total }, (_, i) => this.get(`sbm/bk/${key}_c${i}`))
-      );
-      if (chunkResults.some(c => c === null))
-        return { ok: false, msg: "চাংক পাওয়া যায়নি" };
-      try {
-        const fullJson = chunkResults.join("");
-        return { ok: true, data: this._decompressBackup(JSON.parse(fullJson)), idx };
-      } catch(e) {
-        return { ok: false, msg: `Parse ব্যর্থ: ${e.message}` };
-      }
-    }
-    return { ok: true, data: this._decompressBackup(legacyData), idx };
-  },
-
-  // List all available snapshot slots (for restore UI)
-  async listSnapshots() {
-    const manifest = await this.get("sbm/snaps/manifest");
-    if (!manifest?.slots) {
-      // Legacy: return single entry if old-style backup exists
-      const idx = await this.get("sbm/idx");
-      if (!idx?.k) return [];
-      return [{ slot: "legacy", at: idx.at, label: "পুরনো ব্যাকআপ", meta: idx.meta || {}, isCurrent: true }];
-    }
-    const { cur, slots } = manifest;
-    return Object.entries(slots)
-      .map(([slot, info]) => ({ slot: parseInt(slot), ...info, isCurrent: parseInt(slot) === cur }))
-      .sort((a, b) => new Date(b.at) - new Date(a.at)); // newest first
-  },
-
-  // Quick connection test
+  // Quick RTDB connection test (device-presence/active-devices ফিচারের জন্য)
   async testConnection() {
     const url = this._url("_ping");
     if (!url) return { ok: false, msg: "Database URL দেওয়া নেই" };
@@ -3894,7 +3733,7 @@ const FB = {
 
   isReady() { return !!(this._cfg?.databaseURL); },
 
-  // Register this device in Firebase (for multi-device tracking)
+  // Register this device in Firebase (multi-device presence — Settings-এ active devices list)
   async registerDevice(deviceInfo) {
     const devId = DeviceID.get();
     const url = this._url(`dukan/devices/${devId}`);
@@ -3916,134 +3755,7 @@ const FB = {
     const DAY = 24 * 60 * 60 * 1000;
     return Object.values(data).filter(d => d.lastSeen && (now - d.lastSeen) < DAY);
   },
-
-  // Start polling for changes from other devices (every 30s)
-  startPolling(onNewData, intervalMs = 30000) {
-    if (this._pollTimer) clearInterval(this._pollTimer);
-    this._pollTimer = setInterval(async () => {
-      try {
-        // ── New rolling snapshot path (primary) ────────────────────────────
-        const manifest = await this.get("sbm/snaps/manifest");
-        if (manifest?.cur && manifest?.slots?.[manifest.cur]?.at) {
-          const remoteAt = new Date(manifest.slots[manifest.cur].at).getTime();
-          if (!this._lastSyncAt || remoteAt > this._lastSyncAt) {
-            const backup = await this.loadBackup();
-            if (backup?.ok && backup?.data) {
-              this._lastSyncAt = remoteAt;
-              if (onNewData) onNewData(backup.data, manifest.slots[manifest.cur].at);
-            }
-          }
-          return; // new path found — skip legacy check
-        }
-
-        // ── Legacy fallback: old sbm/idx path ────────────────────────────
-        const idx = await this.get("sbm/idx");
-        if (!idx?.k || !idx?.at) return;
-        const remoteAt = new Date(idx.at).getTime();
-        if (!this._lastSyncAt || remoteAt > this._lastSyncAt) {
-          const backup = await this.loadBackup();
-          if (backup?.ok && backup?.data) {
-            this._lastSyncAt = remoteAt;
-            if (onNewData) onNewData(backup.data, idx.at);
-          }
-        }
-      } catch {}
-    }, intervalMs);
-  },
-
-  stopPolling() {
-    if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
-  },
-
-  setLastSyncAt(ts) { this._lastSyncAt = ts ? new Date(ts).getTime() : null; }
 };
-
-// ─── Dirty Queue — IndexedDB-based Persistent Sync Queue ─────────────────────
-// যেসব record sync হয়নি তাদের queue-এ রাখে — offline-এ কাজ করে, online-এ push করে
-const DirtyQueue = (() => {
-  const DB_NAME  = "hg_dirty_queue";
-  const STORE    = "queue";
-  let _db = null;
-
-  const open = () => new Promise((res, rej) => {
-    if (_db) return res(_db);
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = e => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE, { keyPath: "id" });
-      }
-    };
-    req.onsuccess = e => { _db = e.target.result; res(_db); };
-    req.onerror   = e => rej(e.target.error);
-  });
-
-  return {
-    // Queue-এ record যোগ করো (upsert)
-    async enqueue(record) {
-      try {
-        const db = await open();
-        await new Promise((res, rej) => {
-          const tx  = db.transaction(STORE, "readwrite");
-          const req = tx.objectStore(STORE).put({
-            id:        record.id || ("dq_" + Date.now()),
-            collection: record.collection,
-            data:      record,
-            queuedAt:  new Date().toISOString(),
-          });
-          req.onsuccess = res;
-          req.onerror   = () => rej(req.error);
-        });
-      } catch {}
-    },
-
-    // সব pending items পড়ো
-    async getAll() {
-      try {
-        const db = await open();
-        return new Promise((res, rej) => {
-          const tx  = db.transaction(STORE, "readonly");
-          const req = tx.objectStore(STORE).getAll();
-          req.onsuccess = () => res(req.result || []);
-          req.onerror   = () => rej(req.error);
-        });
-      } catch { return []; }
-    },
-
-    // সফলভাবে sync হওয়া item মুছে দাও
-    async remove(id) {
-      try {
-        const db = await open();
-        await new Promise((res, rej) => {
-          const tx  = db.transaction(STORE, "readwrite");
-          const req = tx.objectStore(STORE).delete(id);
-          req.onsuccess = res;
-          req.onerror   = () => rej(req.error);
-        });
-      } catch {}
-    },
-
-    // সব clear করো (full sync সফল হলে)
-    async clear() {
-      try {
-        const db = await open();
-        await new Promise((res, rej) => {
-          const tx = db.transaction(STORE, "readwrite");
-          tx.objectStore(STORE).clear();
-          tx.oncomplete = res;
-          tx.onerror    = () => rej(tx.error);
-        });
-      } catch {}
-    },
-
-    async size() {
-      try {
-        const all = await this.getAll();
-        return all.length;
-      } catch { return 0; }
-    },
-  };
-})();
 
 // ─── Sync Log — in-memory ring buffer (last 50 entries) ───────────────────────
 // ─── SyncLog — Persistent IndexedDB + in-memory cache ───────────────────────
@@ -4203,405 +3915,6 @@ const SyncLog = (() => {
     },
   };
 })();
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── Vector Clock — lightweight per-device logical clock ─────────────────────
-// প্রতিটি device-এর নিজস্ব counter থাকে।
-// { "dev_abc": 5, "dev_xyz": 3 } → device abc ৫টি write করেছে
-// Causality detection: যদি remote VC local VC-কে dominate করে → remote wins
-// Concurrent writes (true conflict) → field-level merge + audit trail
-// ═══════════════════════════════════════════════════════════════════════════════
-const VectorClock = {
-  _KEY: "sbm_vc",
-
-  // এই device-এর current vector clock পড়ো
-  get() {
-    try { return JSON.parse(localStorage.getItem(this._KEY) || "{}"); } catch { return {}; }
-  },
-
-  // এই device-এর counter বাড়াও
-  tick() {
-    const vc  = this.get();
-    const dev = DeviceID.get();
-    vc[dev]   = (vc[dev] || 0) + 1;
-    try { localStorage.setItem(this._KEY, JSON.stringify(vc)); } catch {}
-    return { ...vc };
-  },
-
-  // remote VC দিয়ে local VC update করো (merge max)
-  merge(remoteVC) {
-    if (!remoteVC || typeof remoteVC !== "object") return;
-    const local = this.get();
-    const merged = { ...local };
-    Object.entries(remoteVC).forEach(([dev, cnt]) => {
-      merged[dev] = Math.max(merged[dev] || 0, cnt);
-    });
-    try { localStorage.setItem(this._KEY, JSON.stringify(merged)); } catch {}
-  },
-
-  // VC তুলনা:
-  //   "dominates" → a সব dimension-এ ≥ b, অন্তত একটায় >
-  //   "dominated" → b সব dimension-এ ≥ a, অন্তত একটায় >
-  //   "concurrent" → কেউ কাউকে dominate করে না (true conflict)
-  //   "equal"     → identical
-  compare(vcA, vcB) {
-    if (!vcA || !vcB) return "unknown";
-    const keysA = Object.keys(vcA), keysB = Object.keys(vcB);
-    const allKeys = [...new Set([...keysA, ...keysB])];
-    let aGtB = false, bGtA = false;
-    for (const k of allKeys) {
-      const a = vcA[k] || 0, b = vcB[k] || 0;
-      if (a > b) aGtB = true;
-      if (b > a) bGtA = true;
-    }
-    if (aGtB && !bGtA) return "dominates";   // a is newer
-    if (bGtA && !aGtB) return "dominated";   // b is newer
-    if (!aGtB && !bGtA) return "equal";
-    return "concurrent";                       // true conflict
-  },
-};
-
-// ─── Device Priority — tie-break for concurrent conflicts ─────────────────────
-// concurrent conflict হলে priority দিয়ে tie-break করি
-// Financial fields-এ (balance, amount) additive merge করি
-const DevicePriority = {
-  // Priority: numeric value যত বেশি তত বেশি আস্থাযোগ্য
-  // Admin device: priority 10, normal: 1
-  _KEY: "sbm_dev_priority",
-  get()  {
-    try { return parseInt(localStorage.getItem(this._KEY) || "1"); } catch { return 1; }
-  },
-  set(v) { try { localStorage.setItem(this._KEY, String(v)); } catch {} },
-};
-
-// ─── Field-Level Merge Strategy ───────────────────────────────────────────────
-// প্রতিটি collection-এর জন্য কোন fields কীভাবে merge হবে সেটা define করা আছে
-const FIELD_MERGE_RULES = {
-  // customers: balance additive নয় (পেমেন্ট independent হওয়ায়), last-write জেতে
-  // কিন্তু name/mobile/address: remote জেতে শুধু যদি local পুরনো হয়
-  customers: {
-    financial: ["balance"],          // higher-value wins (বেশি বাকি = সর্বশেষ state)
-    identity:  ["name","mobile","address","area"],  // last-write
-    protected: ["id","createdAt"],   // কখনো overwrite হয় না
-  },
-  // invoices: immutable — একবার তৈরি হলে কোনো field বদলায় না
-  invoices: {
-    immutable: true,
-  },
-  // txns: immutable — financial ledger, append-only
-  txns: {
-    immutable: true,
-  },
-  // paymentInvoices: immutable
-  paymentInvoices: {
-    immutable: true,
-  },
-  // products: stock additive merge, price last-write
-  products: {
-    additive:  ["stock"],            // দুই device-এর delta যোগ হয়
-    financial: ["price","costPrice"], // last-write (timestamp winner)
-    identity:  ["name","category","unit","minStockAlert","barcode","expiryDate"],
-    protected: ["id","createdAt"],
-    // Fix: batches[] timestamp winner নেবে — costPrice সঠিক রাখতে
-    arrayMerge: ["batches"],
-  },
-  // smsLog: append-only, id দিয়ে deduplicate
-  smsLog: {
-    appendOnly: true,
-  },
-};
-
-// ─── Enhanced FB — Vector Clock + Field-Level Merge + Batch + Delta ───────────
-Object.assign(FB, {
-  _batchTimer:      null,
-  _batchPending:    {},
-  _latencyMs:       null,
-  _connectionState: "unknown",
-  _conflictLog:     [],   // audit trail of resolved conflicts
-
-  // ── stampRecord: updatedAt + deviceId + vector clock ─────────────────────────
-  stampRecord(record, collection) {
-    const vc = VectorClock.tick();
-    return {
-      ...record,
-      updatedAt:    new Date().toISOString(),
-      updatedBy:    DeviceID.get(),
-      _devPriority: DevicePriority.get(),
-      _vc:          vc,          // vector clock snapshot at write time
-      _collection:  collection,
-      synced:       false,
-    };
-  },
-
-  // ── Field-level merge for a single record ────────────────────────────────────
-  // concurrent conflict হলে field-by-field সিদ্ধান্ত নেয়
-  _fieldMerge(local, remote, collection) {
-    const rules = FIELD_MERGE_RULES[collection] || {};
-
-    // immutable collections → remote append, id দিয়ে deduplicate
-    if (rules.immutable) {
-      // invoices/txns কখনো overwrite হয় না — newer বেশি নির্ভরযোগ্য
-      const localTime  = new Date(local.updatedAt  || 0).getTime();
-      const remoteTime = new Date(remote.updatedAt || 0).getTime();
-      const winner = remoteTime >= localTime ? remote : local;
-      SyncLog.add("merge", `[${collection}] immutable → time-pick (id: ${local.id})`);
-      return { ...winner, synced: true, _mergeType: "immutable-time" };
-    }
-
-    // appendOnly → remote + local deduplicated by id (handled at collection level)
-    if (rules.appendOnly) {
-      return { ...remote, synced: true, _mergeType: "appendOnly" };
-    }
-
-    // Protected fields: always keep local value
-    const protected_ = new Set(rules.protected || []);
-
-    // Start from local as base
-    const merged = { ...local };
-
-    // additive fields: delta-based merge
-    // Formula: যদি উভয় device-এ stock আলাদাভাবে বেড়ে থাকে,
-    // তাহলে দুটোর মধ্যে যেটা বেশি সেটা নাও — কারণ আমরা প্রতিটি
-    // stock change delta হিসেবে stockMovements-এ log করি।
-    // True delta merge (remote_delta = remote.stock - base) শুধু তখনই
-    // সম্ভব যদি _baseStock থাকে; না থাকলে max safe।
-    (rules.additive || []).forEach(field => {
-      const lv = Number(local[field]  || 0);
-      const rv = Number(remote[field] || 0);
-      // উভয় device-এ delta track হয় stockMovements-এ।
-      // merge: যেটা বেশি সেটা নাও (conservative — stock কমানো বিপজ্জনক)
-      merged[field] = Math.max(lv, rv);
-      SyncLog.add("merge", `[${collection}] additive field "${field}": max(${lv}, ${rv}) = ${merged[field]}`);
-    });
-
-    // financial fields: higher timestamp's value
-    const localTime  = new Date(local.updatedAt  || 0).getTime();
-    const remoteTime = new Date(remote.updatedAt || 0).getTime();
-    const timeWinner = remoteTime >= localTime ? remote : local;
-    (rules.financial || []).forEach(field => {
-      if (!protected_.has(field)) merged[field] = timeWinner[field];
-    });
-
-    // identity fields: same time-winner
-    (rules.identity || []).forEach(field => {
-      if (!protected_.has(field)) merged[field] = timeWinner[field];
-    });
-
-    // Protected: always local
-    (rules.protected || []).forEach(field => {
-      merged[field] = local[field];
-    });
-
-    // arrayMerge fields: timestamp winner নেয় (batches[] সঠিক রাখতে)
-    (rules.arrayMerge || []).forEach(field => {
-      if (!protected_.has(field)) merged[field] = timeWinner[field] || local[field] || [];
-    });
-
-    // Merge vector clocks
-    merged._vc       = this._mergeVC(local._vc, remote._vc);
-    merged.updatedAt = new Date().toISOString();
-    merged.updatedBy = DeviceID.get();
-    merged._mergeType = "field-level";
-    merged.synced     = false; // merged result needs to be pushed back
-
-    SyncLog.add("merge", `[${collection}] field-level merge complete (id: ${local.id})`);
-    return merged;
-  },
-
-  _mergeVC(vcA, vcB) {
-    if (!vcA && !vcB) return {};
-    if (!vcA) return vcB;
-    if (!vcB) return vcA;
-    const result = { ...vcA };
-    Object.entries(vcB).forEach(([k, v]) => {
-      result[k] = Math.max(result[k] || 0, v);
-    });
-    return result;
-  },
-
-  // ── mergeRecord — vector clock aware, with field-level fallback ───────────────
-  mergeRecord(local, remote, collection = "unknown") {
-    if (!local) {
-      VectorClock.merge(remote?._vc);
-      return remote ? { ...remote, synced: true } : null;
-    }
-    if (!remote) return local;
-
-    const vcResult = VectorClock.compare(local._vc || {}, remote._vc || {});
-
-    if (vcResult === "equal") {
-      SyncLog.add("merge", `[${collection}] VC equal → keep local (id: ${local.id})`);
-      return local;
-    }
-
-    if (vcResult === "dominates") {
-      // local is causally newer → keep local, mark dirty
-      SyncLog.add("merge", `[${collection}] local dominates → local wins (id: ${local.id})`);
-      return { ...local, synced: false };
-    }
-
-    if (vcResult === "dominated") {
-      // remote is causally newer → take remote cleanly
-      VectorClock.merge(remote._vc);
-      SyncLog.add("merge", `[${collection}] remote dominates → remote wins (id: ${local.id})`);
-      return { ...remote, synced: true };
-    }
-
-    // "concurrent" — true conflict → field-level merge
-    SyncLog.add("merge", `[${collection}] CONCURRENT CONFLICT → field-level merge (id: ${local.id})`);
-
-    // Device priority tie-break: higher priority device's timestamp-based fields win
-    const localPri  = local._devPriority  || 1;
-    const remotePri = remote._devPriority || 1;
-    if (localPri !== remotePri) {
-      const priorityWinner = localPri > remotePri ? local : remote;
-      SyncLog.add("merge", `[${collection}] priority tie-break → dev priority ${Math.max(localPri,remotePri)} wins`);
-      VectorClock.merge(priorityWinner._vc);
-      return {
-        ...priorityWinner,
-        _vc:      this._mergeVC(local._vc, remote._vc),
-        synced:   priorityWinner === local ? false : true,
-        _mergeType: "priority-tiebreak",
-      };
-    }
-
-    // Same priority → full field-level merge
-    const result = this._fieldMerge(local, remote, collection);
-    VectorClock.merge(result._vc);
-
-    // Audit trail (last 20 conflicts kept in memory)
-    this._conflictLog.unshift({
-      id: local.id, collection, at: new Date().toISOString(),
-      localTime: local.updatedAt, remoteTime: remote.updatedAt,
-      resolution: result._mergeType,
-    });
-    if (this._conflictLog.length > 20) this._conflictLog.pop();
-
-    return result;
-  },
-
-  // ── mergeCollection — appendOnly collections get union-deduplicate ─────────
-  mergeCollection(localArr, remoteArr, collection = "unknown") {
-    if (!remoteArr?.length) return localArr || [];
-    if (!localArr?.length) return remoteArr.map(r => ({ ...r, synced: true }));
-
-    const rules = FIELD_MERGE_RULES[collection] || {};
-
-    // appendOnly: union by id
-    if (rules.appendOnly) {
-      const seen = new Map((localArr).map(r => [r.id, r]));
-      remoteArr.forEach(r => { if (!seen.has(r.id)) seen.set(r.id, { ...r, synced: true }); });
-      return Array.from(seen.values());
-    }
-
-    const localMap  = new Map(localArr.map(r => [r.id, r]));
-    const remoteMap = new Map(remoteArr.map(r => [r.id, r]));
-
-    remoteMap.forEach((remoteRec, id) => {
-      const localRec = localMap.get(id);
-      localMap.set(id, this.mergeRecord(localRec, remoteRec, collection));
-    });
-
-    return Array.from(localMap.values());
-  },
-
-  // ── pushDelta — dirty records only ───────────────────────────────────────────
-  async pushDelta(allData) {
-    if (!this.isReady()) return { ok: false, msg: "Firebase সেট করা নেই" };
-    const dirty = {};
-    let totalDirty = 0;
-
-    ["customers","products","invoices","txns","paymentInvoices","smsLog"].forEach(col => {
-      const arr = allData[col] || [];
-      const dirtyRecords = arr.filter(r => r.synced === false || !r.updatedAt);
-      if (dirtyRecords.length) {
-        dirty[col]  = dirtyRecords;
-        totalDirty += dirtyRecords.length;
-      }
-    });
-
-    if (totalDirty === 0) {
-      SyncLog.add("info", "কোনো dirty record নেই — skip");
-      return { ok: true, pushed: 0 };
-    }
-
-    SyncLog.add("queue", `${totalDirty}টি dirty record push করা হচ্ছে...`);
-
-    for (const [col, records] of Object.entries(dirty)) {
-      for (const rec of records) await DirtyQueue.enqueue({ ...rec, collection: col });
-    }
-
-    const ts  = new Date().toISOString();
-    const key = `delta_${Date.now()}`;
-    const r   = await this.set(`dukan/delta/${key}`, {
-      data: dirty, deviceId: DeviceID.get(), at: ts, count: totalDirty,
-      vc: VectorClock.get(),
-    });
-
-    if (r.ok) {
-      SyncLog.add("sync", `✓ ${totalDirty}টি record push সফল`);
-      await DirtyQueue.clear();
-      this._connectionState = "online";
-      return { ok: true, pushed: totalDirty };
-    } else {
-      SyncLog.add("error", "Push ব্যর্থ: " + r.msg);
-      this._connectionState = "offline";
-      return { ok: false, msg: r.msg };
-    }
-  },
-
-  // ── batchUpdate — 5s debounce batch write ─────────────────────────────────
-  scheduleBatch(collection, records, onFlush) {
-    if (!this._batchPending[collection]) this._batchPending[collection] = [];
-    for (const rec of records) {
-      const idx = this._batchPending[collection].findIndex(r => r.id === rec.id);
-      if (idx >= 0) this._batchPending[collection][idx] = rec;
-      else this._batchPending[collection].push(rec);
-    }
-    if (this._batchTimer) clearTimeout(this._batchTimer);
-    this._batchTimer = setTimeout(async () => { await this._flushBatch(onFlush); }, 5000);
-  },
-
-  async _flushBatch(onFlush) {
-    const pending = { ...this._batchPending };
-    this._batchPending = {};
-    this._batchTimer   = null;
-    const totalCount   = Object.values(pending).reduce((s, arr) => s + arr.length, 0);
-    if (totalCount === 0) return;
-    SyncLog.add("sync", `Batch flush: ${totalCount}টি record`);
-    const ts  = new Date().toISOString();
-    const key = `batch_${Date.now()}`;
-    const r   = await this.set(`dukan/batch/${key}`, {
-      data: pending, at: ts, deviceId: DeviceID.get(), vc: VectorClock.get(),
-    });
-    if (r.ok) {
-      SyncLog.add("sync", `✓ Batch write সফল (${totalCount} records)`);
-      if (typeof onFlush === "function") onFlush();
-    } else {
-      SyncLog.add("error", "Batch write ব্যর্থ: " + r.msg);
-    }
-  },
-
-  // ── Connection latency test ───────────────────────────────────────────────
-  async measureLatency() {
-    const url = this._url("_ping");
-    if (!url) return null;
-    const t0 = Date.now();
-    try {
-      await fetch(url, { method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ ts: t0 }) });
-      this._latencyMs       = Date.now() - t0;
-      this._connectionState = "online";
-      return this._latencyMs;
-    } catch {
-      this._connectionState = "offline";
-      return null;
-    }
-  },
-
-  getConnectionState() { return this._connectionState; },
-  getLatency()         { return this._latencyMs; },
-  getConflictLog()     { return [...this._conflictLog]; },
-});
 
 // ─── Firebase Phone Auth (REST API — no SDK needed) ──────────────────────────
 // Flow: sendOtp() → verifyOtp() → session saved → auto-login on next open
@@ -7721,7 +7034,7 @@ function SmartBusinessMgmt() {
     cashModal,
     btDevice,         lastAutoBackup,    driveStatus,       backupNeeded,
     anthropicKey,     smsTemplates,      autoBackupEnabled, firebaseConfig,
-    firebaseEnabled,  fbStatus,          fbBackupList,      authSession,
+    firebaseEnabled,  authSession,      googleDriveToken,  lastLocalBackup,
     devContact,       masterResetHash,   activeDevices,     syncToast,
     suppliers,        purchaseOrders,    stockMovements,    cashLogs,
     set: _set, patch: _patch,
@@ -7752,6 +7065,8 @@ function SmartBusinessMgmt() {
   const setDeletedProducts  = (v) => _set("deletedProducts",  v);
   const setPaymentInvoices  = (v) => _set("paymentInvoices",  v);
   const setSmsGateway       = (v) => _set("smsGateway",       v);
+  const setGoogleDriveToken = (v) => _set("googleDriveToken", v);
+  const setLastLocalBackup  = (v) => _set("lastLocalBackup",  v);
   const setDashModal        = (v) => _set("dashModal",        v);
   const setInvModal         = (v) => _set("invModal",         v);
   const setCashModal        = (v) => _set("cashModal",        v);
@@ -7766,8 +7081,6 @@ function SmartBusinessMgmt() {
   const setAutoBackupEnabled= (v) => _set("autoBackupEnabled",v);
   const setFirebaseConfig   = (v) => _set("firebaseConfig",   v);
   const setFirebaseEnabled  = (v) => _set("firebaseEnabled",  v);
-  const setFbStatus         = (v) => _set("fbStatus",         v);
-  const setFbBackupList     = (v) => _set("fbBackupList",     v);
   const setAuthSession      = (v) => _set("authSession",      v);
   const setDevContact       = (v) => _set("devContact",       v);
   const setMasterResetHash  = (v) => _set("masterResetHash",  v);
@@ -7952,55 +7265,25 @@ function SmartBusinessMgmt() {
     })();
   }, []);
 
-  // 📱 Multi-device REAL-TIME sync: Firestore per-record onSnapshot listeners
-  // (no polling)। যেকোনো ডিভাইসে (admin/staff) data বদলালেই onSnapshot handler
-  // সাথে সাথে ফায়ার করে — Firestore-এর native push mechanism ব্যবহার করে।
-  const _rtSetterMap = useRef(null);
-  const _rtValuesRef = useRef(null);
-  const _deletedProductIdsRef = useRef(new Set());
-  useEffect(() => {
-    // keep a stable map of key -> setter, built once, read fresh each time
-    _rtSetterMap.current = {
-      customers: setCustomers, products: setProducts, invoices: setInvoices,
-      txns: setTxns, smsLog: setSmsLog, users: setUsers, suppliers: setSuppliers,
-      purchaseOrders: setPurchaseOrders, stockMovements: setStockMovements,
-      cashLogs: setCashLogs, paymentInvoices: setPaymentInvoices,
-      shopName: setShopName, smsTemplates: setSmsTemplates, smsGateway: setSmsGateway,
-    };
-    // মুছা পণ্যের ID সেট — Firebase sync-এ এগুলো ফিল্টার হবে
-    _deletedProductIdsRef.current = new Set((deletedProducts || []).map(p => p.id));
-    // always-fresh snapshot of current local values, read by seed-if-empty
-    _rtValuesRef.current = {
-      customers, products, invoices, txns, smsLog, users, suppliers,
-      purchaseOrders, stockMovements, cashLogs, paymentInvoices,
-      shopName, smsTemplates, smsGateway,
-    };
-  });
-
-  // Firebase-এ এই collection-এ কোনো document না থাকলে, বর্তমান local data
-  // দিয়ে seed করে — যাতে প্রথম যে ডিভাইস Firebase enable করে সেটাই initial
-  // source of truth হয়।
-  const _fssSeedIfEmpty = useCallback((key, arr) => {
-    if (Array.isArray(arr) && arr.length > 0) return; // already has data, nothing to seed
-    let val = _rtValuesRef.current?.[key];
-    if (!Array.isArray(val) || val.length === 0) return; // nothing meaningful to seed
-    if (key === "products") {
-      const deletedIds = _deletedProductIdsRef.current;
-      val = val.filter(p => !deletedIds.has(p.id));
-    }
-    FSS.setMany(key, val);
-  }, []);
+  // 📱 Multi-device REAL-TIME sync: Firestore onSnapshot (record-level, no polling)
+  // যেকোনো ফোনে (admin/staff) কোনো একটা রেকর্ড বদলালেই বাকি সব ফোনে
+  // millisecond-এ পৌঁছায় — সম্পূর্ণ array ওভাররাইট হয় না, তাই conflict/mismatch
+  // হয় না, আর Firestore-এর built-in offline cache থাকায় নেট না থাকলেও কাজ করে।
+  const [fssReady, setFssReady] = useState(false);
 
   useEffect(() => {
     if (!loaded || !firebaseEnabled || !firebaseConfig) {
       FSS.teardown();
-      FB.stopPolling(); // legacy — device presence polling বন্ধ
+      setFssReady(false);
       return;
     }
     const ok = FSS.init(firebaseConfig);
+    setFssReady(ok);
     if (!ok) return;
 
-    // Legacy device presence (Settings screen device list) — কেপ্ট as-is
+    SyncLog.add("info", "Firestore রিয়েলটাইম সিঙ্ক চালু হয়েছে (instant, record-level)");
+
+    // Device presence (RTDB) — Settings স্ক্রিনে active devices লিস্টের জন্য
     FB.init(firebaseConfig);
     FB.registerDevice({
       platform: typeof window !== "undefined" && window.Capacitor?.isNativePlatform?.() ? "android" : "web",
@@ -8012,70 +7295,59 @@ function SmartBusinessMgmt() {
     }, 5 * 60 * 1000);
     FB.getActiveDevices().then(devs => setActiveDevices(devs));
 
-    FSS.subscribeAll((key, arr) => {
-      const setter = _rtSetterMap.current?.[key];
-      if (!setter) return;
-
-      // baseline রাখি যাতে diff-push নিজের তাজা remote data-কে আবার re-write না করে
-      _fssPrevArr.current[key] = arr;
-      _fssFirstRun.current[key] = true;
-
-      if ((arr?.length || 0) === 0) {
-        _fssSeedIfEmpty(key, arr);
-        return;
-      }
-
-      setSyncToast("syncing");
-      SyncLog.add("sync", `Firebase থেকে রিয়েলটাইম আপডেট: ${key}`);
-
-      if (key === "users") {
-        setter(arr);
-        // staff device-এ লগইন করা currentUser-এর permission instantly update;
-        // admin যদি স্টাফকে মুছে দেয়, সাথে সাথে সেই ডিভাইস থেকে লগআউট করে দিই
-        setCurrentUser(prev => {
-          if (!prev || prev.role !== "staff") return prev;
-          const updated = (arr || []).find(u => u.id === prev.id);
-          if (!updated) {
-            showToast?.("আপনার অ্যাকাউন্ট মুছে ফেলা হয়েছে — লগআউট হচ্ছে", "#ef4444");
-            return null; // force logout
-          }
-          return { ...prev, tempPermissions: updated.tempPermissions || [], canAddProduct: !!updated.canAddProduct };
-        });
-      } else if (key === "products") {
-        const deletedIds = _deletedProductIdsRef.current;
-        const filtered = arr.filter(p => !deletedIds.has(p.id));
-        setter(filtered);
-      } else {
-        setter(arr);
-      }
-
-      FSS._connectionState = "online";
-      setSyncToast("synced");
-      setTimeout(() => setSyncToast(null), 1500);
-    });
-
-    FSS.subscribeSettings((data) => {
-      if (data?.shopName !== undefined) setShopName(data.shopName);
-      if (data?.smsTemplates !== undefined) setSmsTemplates(data.smsTemplates);
-      if (data?.smsGateway !== undefined) setSmsGateway(data.smsGateway);
-      _fssSettingsFirstRun.current = true;
-    });
-
-    SyncLog.add("info", "Firestore রিয়েলটাইম সিঙ্ক চালু হয়েছে (per-record, polling নেই)");
-
-    const onOnline  = () => { FSS.init(firebaseConfig); };
-    const onOffline = () => { FSS._connectionState = "offline"; };
-    window.addEventListener("online",  onOnline);
-    window.addEventListener("offline", onOffline);
+    const onOnline = () => { const r = FSS.init(firebaseConfig); setFssReady(r); };
+    window.addEventListener("online", onOnline);
 
     return () => {
       clearInterval(devTimer);
+      window.removeEventListener("online", onOnline);
       FSS.teardown();
-      window.removeEventListener("online",  onOnline);
-      window.removeEventListener("offline", onOffline);
+      setFssReady(false);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, firebaseEnabled, firebaseConfig]);
+
+  // ── প্রতিটা collection — local array ↔ Firestore (record-level, real-time) ──
+  useFSSCollection("customers", customers, setCustomers, fssReady, { onSync: setSyncToast });
+  useFSSCollection("products", products, setProducts, fssReady, {
+    onSync: setSyncToast,
+    filterIncoming: (arr) => {
+      const deletedIds = new Set((deletedProducts || []).map(p => p.id));
+      return arr.filter(p => !deletedIds.has(p.id));
+    },
+  });
+  useFSSCollection("invoices", invoices, setInvoices, fssReady, { onSync: setSyncToast });
+  useFSSCollection("txns", txns, setTxns, fssReady, { onSync: setSyncToast });
+  useFSSCollection("smsLog", smsLog, setSmsLog, fssReady, { onSync: setSyncToast });
+  useFSSCollection("suppliers", suppliers, setSuppliers, fssReady, { onSync: setSyncToast });
+  useFSSCollection("purchaseOrders", purchaseOrders, setPurchaseOrders, fssReady, { onSync: setSyncToast });
+  useFSSCollection("stockMovements", stockMovements, setStockMovements, fssReady, { onSync: setSyncToast });
+  useFSSCollection("cashLogs", cashLogs, setCashLogs, fssReady, { onSync: setSyncToast });
+  useFSSCollection("paymentInvoices", paymentInvoices, setPaymentInvoices, fssReady, { onSync: setSyncToast });
+  // 🔑 users (permissions) — instant push/apply, debounce ছাড়া
+  useFSSCollection("users", users, setUsers, fssReady, { instant: true, onSync: setSyncToast });
+  useFSSSettings(fssReady, shopName, setShopName, smsTemplates, setSmsTemplates, smsGateway, setSmsGateway, googleDriveToken, setGoogleDriveToken);
+
+  // 🔑 admin কোনো স্টাফের permission বদলালে/মুছলে — Firestore থেকে users
+  // আপডেট হওয়ার সাথে সাথেই (millisecond-এ) এই ডিভাইসের currentUser-এ প্রতিফলিত
+  // হয় (reload/re-login লাগে না); স্টাফ মুছে দিলে সাথে সাথে লগআউট হয়ে যায়।
+  useEffect(() => {
+    if (!loaded) return;
+    setCurrentUser(prev => {
+      if (!prev || prev.role !== "staff") return prev;
+      const updated = (users || []).find(u => u.id === prev.id);
+      if (!updated) {
+        showToast?.("আপনার অ্যাকাউন্ট মুছে ফেলা হয়েছে — লগআউট হচ্ছে", "#ef4444");
+        return null;
+      }
+      if (
+        JSON.stringify(updated.tempPermissions || []) === JSON.stringify(prev.tempPermissions || []) &&
+        !!updated.canAddProduct === !!prev.canAddProduct
+      ) return prev;
+      return { ...prev, tempPermissions: updated.tempPermissions || [], canAddProduct: !!updated.canAddProduct };
+    });
+  }, [users, loaded]);
+
 
   useEffect(() => { if (loaded) debouncedSave(SK.customers, customers, 1500); }, [customers, loaded]);
   useEffect(() => { if (loaded) debouncedSave(SK.products,  products,  1500); }, [products, loaded]);
@@ -8341,9 +7613,7 @@ function SmartBusinessMgmt() {
           invoices: invoices.length, txns: txns.length,
           smsLog: smsLog.length, paymentInvoices: paymentInvoices.length,
           purchaseOrders: purchaseOrders.length, stockMovements: stockMovements.length,
-          users: (users||[]).length,
-          cashLogs: (cashLogs||[]).length,
-          suppliers: (suppliers||[]).length,
+          users: (users||[]).length, cashLogs: (cashLogs||[]).length, suppliers: (suppliers||[]).length,
         },
       },
     };
@@ -8362,36 +7632,10 @@ function SmartBusinessMgmt() {
       await save(SK.lastAutoBackup, ts);
       // 2️⃣ Save snapshot for local multi-device (use IndexedDB SnapshotDB, not raw save)
       await SnapshotDB.save({ ...data, _savedAt: ts });
-
-      // 3️⃣ 🔥 Firestore force re-seed (if enabled) — এই ডিভাইসের বর্তমান data দিয়ে
-      // সব collection ওভাররাইট করে সব ডিভাইসে সাথে সাথে পৌঁছায়।
-      if (FSS.isReady() && firebaseEnabled) {
-        try {
-          await Promise.all([
-            FSS.setMany("customers", customers),
-            FSS.setMany("products", products),
-            FSS.setMany("invoices", invoices),
-            FSS.setMany("txns", txns),
-            FSS.setMany("smsLog", smsLog),
-            FSS.setMany("users", users),
-            FSS.setMany("suppliers", suppliers),
-            FSS.setMany("purchaseOrders", purchaseOrders),
-            FSS.setMany("stockMovements", stockMovements),
-            FSS.setMany("cashLogs", cashLogs),
-            FSS.setMany("paymentInvoices", paymentInvoices),
-            FSS.setSettings({ shopName, smsTemplates, smsGateway }),
-          ]);
-          const ts2 = new Date().toISOString();
-          setFbBackupList([{ at: ts2, slot: "firestore" }]);
-          SyncLog.add("sync", "✓ Firestore manual sync সম্পন্ন");
-          showToast("💾 লোকাল + ☁️ Firestore ব্যাকআপ সম্পন্ন");
-        } catch (fe) {
-          SyncLog.add("error", "Firestore sync ব্যর্থ: " + fe.message);
-          showToast("💾 লোকাল সেভ | Firestore: ব্যর্থ", "#f59e0b");
-        }
-      } else {
-        showToast("💾 লোকাল ব্যাকআপ সম্পন্ন");
-      }
+      // ব্যবসায়িক ডেটা ইতিমধ্যে Firestore-এ রিয়েল-টাইম record-level sync হয়ে
+      // যাচ্ছে (useFSSCollection হুকগুলো দিয়ে) — এখানে আলাদা করে push করার
+      // দরকার নেই। Google Drive ও Local File auto-backup আলাদা টাইমারে চলে।
+      showToast("💾 লোকাল ব্যাকআপ সম্পন্ন");
 
       setBackupNeeded(false);
       setDriveStatus("success");
@@ -8401,88 +7645,53 @@ function SmartBusinessMgmt() {
       showToast("ব্যাকআপ ব্যর্থ হয়েছে", "#ef4444");
       setTimeout(() => setDriveStatus(null), 4000);
     }
-  }, [buildBackupData, showToast, firebaseEnabled, customers, products, invoices, txns,
-      smsLog, users, suppliers, purchaseOrders, stockMovements, cashLogs,
-      paymentInvoices, shopName, smsTemplates, smsGateway]);
+  }, [buildBackupData, showToast]);
 
-  // 🔥 Firestore per-record push — array বদলালে পুরনো vs নতুন compare করে শুধু
-  // যা যোগ/পরিবর্তন/মুছা হয়েছে সেই record-টাই Firestore-এ লেখা হয় (পুরো array
-  // ওভাররাইট নয়)। কম ডেটা ট্রান্সফার, কনফ্লিক্ট-মুক্ত, এবং offline-এ built-in cache কাজ করে।
-  const _fssPrevArr = useRef({});
-  const _fssFirstRun = useRef({});
-  const _fssPushArrayKey = useCallback((key, arr) => {
-    if (!loaded || !firebaseEnabled || !FSS.isReady()) return;
-    if (!_fssFirstRun.current[key]) {
-      // প্রথমবার (app load/Firebase connect) — শুধু baseline রাখি, push করি না
-      _fssFirstRun.current[key] = true;
-      _fssPrevArr.current[key] = arr || [];
-      return;
-    }
-    const prev = _fssPrevArr.current[key] || [];
-    const cur  = arr || [];
-    _fssPrevArr.current[key] = cur;
-
-    const prevMap = new Map(prev.map(r => [String(r?.id), r]));
-    const curIds  = new Set();
-    cur.forEach(rec => {
-      if (rec?.id === undefined || rec?.id === null) return;
-      curIds.add(String(rec.id));
-      const prevRec = prevMap.get(String(rec.id));
-      if (!prevRec || JSON.stringify(prevRec) !== JSON.stringify(rec)) {
-        FSS.setRecord(key, rec.id, rec);
-      }
-    });
-    prevMap.forEach((_, id) => {
-      if (!curIds.has(id)) FSS.deleteRecord(key, id);
-    });
-  }, [loaded, firebaseEnabled]);
-
-  // 🔥 Firestore settings (shopName/smsTemplates/smsGateway) push — একটাই doc
-  const _fssSettingsFirstRun = useRef(false);
-  const _fssPushSettings = useCallback(() => {
-    if (!loaded || !firebaseEnabled || !FSS.isReady()) return;
-    if (!_fssSettingsFirstRun.current) { _fssSettingsFirstRun.current = true; return; }
-    FSS.setSettings({ shopName, smsTemplates, smsGateway });
-  }, [loaded, firebaseEnabled, shopName, smsTemplates, smsGateway]);
-
-  useEffect(() => { _fssPushArrayKey("customers", customers); }, [customers, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("products", products); }, [products, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("invoices", invoices); }, [invoices, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("txns", txns); }, [txns, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("smsLog", smsLog); }, [smsLog, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("paymentInvoices", paymentInvoices); }, [paymentInvoices, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("purchaseOrders", purchaseOrders); }, [purchaseOrders, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("stockMovements", stockMovements); }, [stockMovements, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("cashLogs", cashLogs); }, [cashLogs, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("suppliers", suppliers); }, [suppliers, _fssPushArrayKey]);
-  useEffect(() => { _fssPushArrayKey("users", users); }, [users, _fssPushArrayKey]);
-  useEffect(() => { _fssPushSettings(); }, [shopName, smsTemplates, smsGateway, _fssPushSettings]);
-
-  // 🔥 Restore from Firestore — সব collection একবারে pull করে state-এ বসায়
-  const restoreFromFirebase = useCallback(async () => {
-    if (!FSS.isReady()) return { ok: false, msg: "Firestore সংযুক্ত নেই" };
-    try {
-      const keys = ["customers","products","invoices","txns","paymentInvoices",
-                    "purchaseOrders","stockMovements","cashLogs","suppliers","smsLog","users"];
-      const results = await Promise.all(keys.map(k => FSS.getAllOnce(k)));
-      const data = {};
-      keys.forEach((k, i) => { if (results[i]?.length) data[k] = results[i]; });
-      // settings
-      try {
-        const sSnap = await FSS.getAllOnce("settings"); // unused — settings/main আলাদা
-      } catch {}
-      return { ok: true, data };
-    } catch (e) {
-      return { ok: false, msg: e.message || "Firestore restore ব্যর্থ" };
-    }
-  }, []);
-
-  // 🔥 Firestore-এ data থাকলে fbBackupList-এ একটা entry রাখি — "Last sync" দেখাতে
+  // ── ধাপ ৪+৫: প্রতি ৫ মিনিটে নিঃশব্দ background auto-backup (admin + staff, সব ফোনে) ──
+  // UI ছাড়া চলে, কোনো screen/toggle নির্ভর নয়। ব্যবসায়িক ডেটা এমনিতেই Firestore-এ
+  // রিয়েল-টাইম sync হয় — এই timer শুধু বাড়তি safety-net (local file + Google Drive)।
+  // অ্যাডমিন ফোন নিজের OAuth token সাইলেন্টলি রিফ্রেশ করে Firestore settings-এ রাখে;
+  // স্টাফ ফোন নিজে OAuth না করে সেই token দিয়েই অ্যাডমিনের Drive-এ আপলোড করে।
   useEffect(() => {
-    if (!loaded || !firebaseEnabled || !FSS.isReady()) return;
-    // lastAutoBackup থেকেই "Last sync" দেখাবে — আলাদা list দরকার নেই
-    if (lastAutoBackup) setFbBackupList([{ at: lastAutoBackup, slot: "firestore" }]);
-  }, [loaded, firebaseEnabled, lastAutoBackup]);
+    if (!loaded || !firebaseEnabled || !firebaseConfig) return;
+    const isStaffDevice = currentUser?.role === "staff";
+
+    const runLocalBackup = async () => {
+      try {
+        const data = buildBackupData();
+        const dateStr = new Date().toISOString().split("T")[0];
+        await FS.saveBackup(data, `sbm-auto-${dateStr}.json`);
+        const ts = new Date().toISOString();
+        setLastLocalBackup(ts);
+        await save(SK.lastLocalBackup, ts);
+        if (Math.random() < 0.1) FS.deleteOldBackups(7); // মাঝেমধ্যে পুরনো (>৭দিন) ফাইল পরিষ্কার
+      } catch {}
+    };
+
+    const runDriveBackup = async () => {
+      try {
+        let token = null;
+        if (!isStaffDevice) {
+          token = await GDrive.ensureTokenSilent(GOOGLE_WEB_CLIENT_ID);
+          if (token) setGoogleDriveToken({ token, savedAt: Date.now() });
+        } else {
+          const tk = googleDriveToken;
+          const fresh = tk?.token && tk?.savedAt && (Date.now() - tk.savedAt) < 55 * 60 * 1000;
+          token = fresh ? tk.token : null;
+        }
+        if (!token) return; // silent refresh ব্যর্থ/token নেই — এই cycle skip, পরে আবার চেষ্টা
+        const data = buildBackupData();
+        await GDrive.uploadBackup(token, { ...data, _autoBackup: true, _savedAt: new Date().toISOString() });
+      } catch {}
+    };
+
+    const cycle = () => { runLocalBackup(); runDriveBackup(); };
+    const timer = setInterval(cycle, 5 * 60 * 1000);
+    const firstRun = setTimeout(cycle, 30000); // অ্যাপ ওপেন হওয়ার ৩০ সেকেন্ড পর প্রথমবার
+
+    return () => { clearInterval(timer); clearTimeout(firstRun); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, firebaseEnabled, firebaseConfig, currentUser?.role]);
 
   const sendSMS = useCallback(async (customer, type, amount) => {
     const text = await generateSMS(customer, type, amount, customer.balance, shopName, anthropicKey, smsTemplates);
@@ -9179,8 +8388,6 @@ function SmartBusinessMgmt() {
               autoBackupEnabled={autoBackupEnabled} setAutoBackupEnabled={setAutoBackupEnabled}
               firebaseConfig={firebaseConfig} setFirebaseConfig={setFirebaseConfig}
               firebaseEnabled={firebaseEnabled} setFirebaseEnabled={setFirebaseEnabled}
-              fbStatus={fbStatus} fbBackupList={fbBackupList}
-              restoreFromFirebase={restoreFromFirebase}
               setAuthSession={setAuthSession}
               devContact={devContact} setDevContact={setDevContact}
               masterResetHash={masterResetHash} setMasterResetHash={setMasterResetHash}
@@ -9189,6 +8396,7 @@ function SmartBusinessMgmt() {
               recoveryPhone={recoveryPhone} setRecoveryPhone={setRecoveryPhoneState}
               recoveryPinHash={recoveryPinHash} setRecoveryPinHash={setRecoveryPinHashState}
               cashLogs={cashLogs} setCashLogs={setCashLogs}
+              suppliers={suppliers} setSuppliers={setSuppliers}
               hasPerm={hasPerm}
             />
             </React.Suspense>
@@ -9872,7 +9080,7 @@ function LoginScreen({ users, onLogin, shopName, T, setUsers, devContact, master
 
   // ── স্টাফ লগইন ──
   // Firestore sync এখনো নতুন স্টাফ pull না করে থাকলে (race condition — staff তৈরির
-  // ঠিক পরপরই login করতে চাইলে), local users-এ না পেলে একবার সরাসরি Firebase
+  // ঠিক পরপরই login করতে চাইলে), local users-এ না পেলে একবার সরাসরি Firestore
   // থেকে fresh users fetch করে আবার চেষ্টা করি — fail করার আগে শেষ চেষ্টা।
   const [staffChecking, setStaffChecking] = useState(false);
   const tryStaffMatch = (list, uname) =>
@@ -9884,9 +9092,9 @@ function LoginScreen({ users, onLogin, shopName, T, setUsers, devContact, master
     let user = tryStaffMatch(users, uname);
 
     if (!user && FSS.isReady()) {
-      // local list-এ নেই — Firebase-এ সরাসরি একবার দেখি (sync এখনো না পৌঁছালে)
+      // local list-এ নেই — Firestore-এ সরাসরি একবার দেখি (sync এখনো না পৌঁছালে)
       setStaffChecking(true);
-      const remoteUsers = await FSS.getAllOnce("users");
+      const remoteUsers = await FSS.getCollectionOnce("users");
       setStaffChecking(false);
       if (Array.isArray(remoteUsers) && remoteUsers.length) {
         user = tryStaffMatch(remoteUsers, uname);
@@ -17494,7 +16702,7 @@ function StaffCustomTimePicker({ T, staffName, onGrant }) {
 }
 
 function Settings_({ T, S, shopName,
- setShopName, users, setUsers, currentUser, setCurrentUser, showToast, customers, setCustomers, products, setProducts, invoices, setInvoices, txns, setTxns, smsLog, setSmsLog, sendSMS, darkMode, setDarkMode, activeTheme, setActiveTheme, fontSize, setFontSize, deletedCustomers, setDeletedCustomers, deletedProducts = [], setDeletedProducts, smsGateway, setSmsGateway, btConnected, btDevice, onConnectBluetooth, onDisconnectBluetooth, paymentInvoices, setPaymentInvoices, purchaseOrders = [], setPurchaseOrders, stockMovements = [], setStockMovements, lastAutoBackup, driveStatus, backupNeeded, performDriveBackup, buildBackupData, setBackupNeeded, anthropicKey, setAnthropicKey, smsTemplates, setSmsTemplates, autoBackupEnabled, setAutoBackupEnabled, firebaseConfig, setFirebaseConfig, firebaseEnabled, setFirebaseEnabled, fbStatus, fbBackupList, restoreFromFirebase, setAuthSession, devContact, setDevContact, masterResetHash, setMasterResetHash, activeDevices = [], setActiveDevices, recoveryPhone, setRecoveryPhone, recoveryPinHash, setRecoveryPinHash, cashLogs = [], setCashLogs, hasPerm }) {
+ setShopName, users, setUsers, currentUser, setCurrentUser, showToast, customers, setCustomers, products, setProducts, invoices, setInvoices, txns, setTxns, smsLog, setSmsLog, sendSMS, darkMode, setDarkMode, activeTheme, setActiveTheme, fontSize, setFontSize, deletedCustomers, setDeletedCustomers, deletedProducts = [], setDeletedProducts, smsGateway, setSmsGateway, btConnected, btDevice, onConnectBluetooth, onDisconnectBluetooth, paymentInvoices, setPaymentInvoices, purchaseOrders = [], setPurchaseOrders, stockMovements = [], setStockMovements, lastAutoBackup, driveStatus, backupNeeded, performDriveBackup, buildBackupData, setBackupNeeded, anthropicKey, setAnthropicKey, smsTemplates, setSmsTemplates, autoBackupEnabled, setAutoBackupEnabled, firebaseConfig, setFirebaseConfig, firebaseEnabled, setFirebaseEnabled, setAuthSession, devContact, setDevContact, masterResetHash, setMasterResetHash, activeDevices = [], setActiveDevices, recoveryPhone, setRecoveryPhone, recoveryPinHash, setRecoveryPinHash, cashLogs = [], setCashLogs, suppliers = [], setSuppliers, hasPerm }) {
   const [editName,    setEditName]    = useState(false);
   const [nameInput,   setNameInput]   = useState(shopName);
   const [showNewUser, setShowNewUser] = useState(false);
@@ -17534,16 +16742,10 @@ function Settings_({ T, S, shopName,
   const [showAllLogs, setShowAllLogs] = useState(false);
   // 🔥 Firebase state
   const [showFbSetup, setShowFbSetup] = useState(false);
-  const [fbForm,      setFbForm]      = useState(firebaseConfig || { databaseURL: "", apiKey: "", projectId: "", authDomain: "" });
+  const [fbForm,      setFbForm]      = useState(firebaseConfig || { databaseURL: "", apiKey: "", projectId: "" });
   const [fbTesting,   setFbTesting]   = useState(false);
-  const [fbMigrating, setFbMigrating] = useState(false);
   const [fbTestMsg,   setFbTestMsg]   = useState(null);
-  const [showRestore,    setShowRestore]    = useState(false);
-  const [restoring,      setRestoring]      = useState(false);
-  const [restoreSlot,    setRestoreSlot]    = useState(null);   // selected snapshot slot
   const [fbClearing,     setFbClearing]     = useState(false);
-  const [freshStarting,  setFreshStarting]  = useState(false);
-  const [showRestoreMenu,setShowRestoreMenu] = useState(false);
   const [showSmsSection, setShowSmsSection] = useState(false);
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [showFontPicker,  setShowFontPicker]  = useState(false);
@@ -17611,16 +16813,11 @@ function Settings_({ T, S, shopName,
       setStockMovements([]); setDeletedProducts([]); setDeletedCustomers([]);
       if (typeof setCashLogs === "function") setCashLogs([]);
 
-      // 2️⃣ Firebase — লাইভ রিয়েল-টাইম ডেটা (sbm/data/*) + ব্যাকআপ স্ন্যাপশট সব মুছো
+      // 2️⃣ Firestore — লাইভ রিয়েল-টাইম ডেটা (সব collection + settings) মুছো
       if (firebaseEnabled && firebaseConfig) {
         try {
           FSS.init(firebaseConfig);
           await FSS.clearAllData();
-        } catch {}
-        try {
-          FB.init(firebaseConfig);
-          await FB.deleteAllBackups();
-          setFbBackupList([]);
         } catch {}
       }
 
@@ -18120,7 +17317,7 @@ function Settings_({ T, S, shopName,
 
               {/* Action button */}
               <button
-                onClick={() => { if (firebaseEnabled && !fbUnlocked) { setMkTarget("firebase"); setShowFbSetup(false); } else { setShowFbSetup(v => !v); } }}
+                onClick={() => { if (!fbUnlocked) { setMkTarget("firebase"); setShowFbSetup(false); } else { setShowFbSetup(v => !v); } }}
                 style={{
                   width:"100%", padding:"8px 0", borderRadius:10, border:`1px solid ${COLOR}44`,
                   background: isActive ? `${COLOR}22` : `${COLOR}15`,
@@ -18518,10 +17715,16 @@ function Settings_({ T, S, shopName,
           borderRadius:18, border:"1.5px solid #f9731633",
           padding:"16px", animation:"hg-slide-in 0.25s ease",
         }}>
-          {/* Master Key verified badge */}
-          <div style={{ display:"flex", alignItems:"center", gap:8, background:"#7c3aed12", border:"1px solid #7c3aed30", borderRadius:10, padding:"8px 12px", marginBottom:14 }}>
+          {/* Master Key verified badge + Firestore status */}
+          <div style={{ display:"flex", alignItems:"center", gap:8, background:"#7c3aed12", border:"1px solid #7c3aed30", borderRadius:10, padding:"8px 12px", marginBottom:8 }}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2.5" strokeLinecap="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
             <span style={{ color:"#a78bfa", fontSize:11, fontWeight:700 }}>Master Key Verified — Firebase Configuration</span>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:8, background: fssReady ? "#22c55e12" : "#64748b12", border:`1px solid ${fssReady ? "#22c55e30" : "#64748b30"}`, borderRadius:10, padding:"8px 12px", marginBottom:14 }}>
+            <span style={{ width:8, height:8, borderRadius:99, background: fssReady ? "#22c55e" : "#64748b", display:"inline-block" }} />
+            <span style={{ color: fssReady ? "#4ade80" : "#94a3b8", fontSize:11, fontWeight:700 }}>
+              Firestore: {fssReady ? "সংযুক্ত (real-time sync চলছে)" : "সংযুক্ত নেই"}
+            </span>
           </div>
 
           <label style={S.label}>Database URL</label>
@@ -18540,12 +17743,6 @@ function Settings_({ T, S, shopName,
             value={fbForm.projectId || ""}
             onChange={e => setFbForm(f => ({ ...f, projectId: e.target.value.trim() }))} />
 
-          <label style={S.label}>Auth Domain</label>
-          <input style={{ ...S.input, fontFamily:"monospace", fontSize:12 }}
-            placeholder="your-project-id.firebaseapp.com"
-            value={fbForm.authDomain || ""}
-            onChange={e => setFbForm(f => ({ ...f, authDomain: e.target.value.trim() }))} />
-
           {fbTestMsg && (
             <div style={{ background: fbTestMsg.ok ? "#22c55e18" : "#ef444418", color: fbTestMsg.ok ? "#22c55e" : "#ef4444", borderRadius:8, padding:"8px 12px", fontSize:12, marginBottom:8, fontWeight:600 }}>
               {fbTestMsg.msg}
@@ -18555,18 +17752,24 @@ function Settings_({ T, S, shopName,
           <div style={{ display:"flex", gap:8 }}>
             <button style={{ ...S.cancelBtn, flex:1, opacity:fbTesting?0.7:1 }} disabled={fbTesting}
               onClick={async () => {
-                if (!fbForm.databaseURL) { setFbTestMsg({ ok:false, msg:"Please enter Database URL" }); return; }
+                if (!fbForm.projectId || !fbForm.apiKey) { setFbTestMsg({ ok:false, msg:"Please enter API Key ও Project ID" }); return; }
                 setFbTesting(true); setFbTestMsg(null);
-                FB.init(fbForm);
-                const r = await FB.testConnection();
-                setFbTestMsg(r); setFbTesting(false);
+                const fsResult = await FSS.testConnection(fbForm);
+                let rtMsg = "";
+                if (fbForm.databaseURL) {
+                  FB.init(fbForm);
+                  const rtResult = await FB.testConnection();
+                  if (!rtResult.ok) rtMsg = " | RTDB (device list): " + rtResult.msg;
+                }
+                setFbTestMsg({ ok: fsResult.ok, msg: fsResult.msg + rtMsg });
+                setFbTesting(false);
               }}>
               {fbTesting ? "Testing..." : "🔌 Test Connection"}
             </button>
             <button style={{ ...S.saveBtn, flex:1 }}
               onClick={() => {
-                if (!fbForm.databaseURL || !/firebaseio\.com|firebasedatabase\.app/.test(fbForm.databaseURL)) {
-                  showToast("Enter valid Firebase URL","#ef4444"); return;
+                if (!fbForm.projectId || !fbForm.apiKey) {
+                  showToast("Project ID ও API Key দিন","#ef4444"); return;
                 }
                 FB.init(fbForm);
                 FSS.init(fbForm);
@@ -18587,39 +17790,19 @@ function Settings_({ T, S, shopName,
           )}
           {firebaseEnabled && (
             <button
-              disabled={fbMigrating}
-              style={{ ...S.cancelBtn, width:"100%", marginTop:8, color:"#f59e0b", opacity: fbMigrating ? 0.6 : 1 }}
-              onClick={async () => {
-                if (!window.confirm("পুরনো Firebase sync data মুছে এই ডিভাইসের বর্তমান data দিয়ে নতুন করে শুরু হবে। সব ডিভাইসে এই data পৌঁছাবে। আগে নিশ্চিত হোন এই ডিভাইসের data-ই সবচেয়ে সঠিক। চালিয়ে যাবেন?")) return;
-                setFbMigrating(true);
-                FSS.init(fbForm);
-                const result = await FSS.purgeAndReseed({
-                  customers, products, invoices, txns, smsLog, users,
-                  purchaseOrders, stockMovements, cashLogs, paymentInvoices,
-                  shopName, smsTemplates, smsGateway,
-                });
-                setFbMigrating(false);
-                if (result.ok) showToast("✅ Sync data reset হয়েছে — সব ডিভাইসে নতুন data যাচ্ছে");
-                else showToast(`❌ ব্যর্থ: ${result.msg}`, "#ef4444");
-              }}>
-              {fbMigrating ? "Reset হচ্ছে..." : "🔄 পুরনো Sync Data মুছে নতুন করে শুরু করুন"}
-            </button>
-          )}
-          {firebaseEnabled && (
-            <button
               disabled={fbClearing}
               style={{ ...S.cancelBtn, width:"100%", marginTop:8, color:"#ef4444", border:"1px solid #ef444444", opacity: fbClearing ? 0.6 : 1 }}
               onClick={async () => {
-                if (!window.confirm("⚠️ Firebase-এর সব ব্যবসায়িক ডেটা (পণ্য, কাস্টমার, ইনভয়েস সব) চিরতরে মুছে যাবে। নিশ্চিত?")) return;
-                if (!window.confirm("শেষ সুযোগ — Firebase-এর সব ডেটা মুছবেন?")) return;
+                if (!window.confirm("⚠️ Firestore-এর সব ব্যবসায়িক ডেটা (পণ্য, কাস্টমার, ইনভয়েস সব) চিরতরে মুছে যাবে। নিশ্চিত?")) return;
+                if (!window.confirm("শেষ সুযোগ — Firestore-এর সব ডেটা মুছবেন?")) return;
                 setFbClearing(true);
                 FSS.init(fbForm);
                 const result = await FSS.clearAllData();
                 setFbClearing(false);
-                if (result.ok) showToast("✅ Firebase ডেটা মুছা হয়েছে", "#ef4444");
+                if (result.ok) showToast("✅ Firestore ডেটা মুছা হয়েছে", "#ef4444");
                 else showToast(`❌ ব্যর্থ: ${result.msg}`, "#ef4444");
               }}>
-              {fbClearing ? "মুছা হচ্ছে..." : "🗑️ Firebase-এর সব ডেটা মুছুন"}
+              {fbClearing ? "মুছা হচ্ছে..." : "🗑️ Firestore-এর সব ডেটা মুছুন"}
             </button>
           )}
         </div>
@@ -18706,20 +17889,13 @@ function Settings_({ T, S, shopName,
               <div style={{ color:"#0ea5e9", fontSize:12, fontWeight:700 }}>This is the only active device</div>
             </div>
           )}
-          {/* Last sync info */}
-          <div style={{ background:"#f9731610", borderRadius:12, padding:"10px 14px", marginBottom:10, border:"1px solid #f9731622" }}>
+          {/* লাইভ ডেটা কাউন্ট — Firestore-এ প্রতিটা রেকর্ড রিয়েল-টাইমে sync হয়,
+              আলাদা করে "restore" করার দরকার নেই */}
+          <div style={{ background:"#f9731610", borderRadius:12, padding:"10px 14px", border:"1px solid #f9731622" }}>
             <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
               <span style={{ color:"#f97316", fontSize:11, fontWeight:700 }}>
-                Last sync:{" "}
-                {fbBackupList[0]?.at
-                  ? (() => {
-                      const d = new Date(fbBackupList[0].at);
-                      const diff = Math.floor((Date.now()-d)/60000);
-                      const ago = diff<1?"just now":diff<60?`${diff}m ago`:diff<1440?`${Math.floor(diff/60)}h ago`:`${Math.floor(diff/1440)}d ago`;
-                      return `${d.toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit"})} · ${ago}`;
-                    })()
-                  : "Not synced yet"}
+                Firestore: {fssReady ? "রিয়েল-টাইম সিঙ্ক চলছে" : "সংযুক্ত নেই"}
               </span>
             </div>
             <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
@@ -18737,10 +17913,6 @@ function Settings_({ T, S, shopName,
               ))}
             </div>
           </div>
-          <button style={{ ...S.saveBtn, width:"100%", background:"#f9731622", color:"#f97316", border:"1px solid #f9731644" }}
-            onClick={() => setShowRestore(true)}>
-            ♻️ Restore from Firebase
-          </button>
           </>)}
         </div>
       )}
@@ -18757,8 +17929,8 @@ function Settings_({ T, S, shopName,
             <span style={{ color:"#a78bfa", fontSize:11, fontWeight:700 }}>Master Key Verified — Google Drive Configuration</span>
           </div>
           <GoogleDriveSection
-            data={{ customers, products, invoices, txns, paymentInvoices, smsLog, purchaseOrders, stockMovements }}
-            setters={{ setCustomers, setProducts, setInvoices, setTxns, setPaymentInvoices, setSmsLog, setPurchaseOrders, setStockMovements }}
+            data={{ customers, products, invoices, txns, paymentInvoices, smsLog, purchaseOrders, stockMovements, users, cashLogs, suppliers }}
+            setters={{ setCustomers, setProducts, setInvoices, setTxns, setPaymentInvoices, setSmsLog, setPurchaseOrders, setStockMovements, setUsers, setCashLogs, setSuppliers }}
             showToast={showToast} T={T} S={S}
           />
           <button style={{ ...S.cancelBtn, width:"100%", marginTop:10, color:"#4285F4", border:"1px solid #4285F433" }}
@@ -18780,8 +17952,8 @@ function Settings_({ T, S, shopName,
             <span style={{ color:"#a78bfa", fontSize:11, fontWeight:700 }}>Master Key Verified — Local Storage Configuration</span>
           </div>
           <LocalStorageSection
-            data={{ customers, products, invoices, txns, paymentInvoices, smsLog, purchaseOrders, stockMovements }}
-            setters={{ setCustomers, setProducts, setInvoices, setTxns, setPaymentInvoices, setSmsLog, setPurchaseOrders, setStockMovements }}
+            data={{ customers, products, invoices, txns, paymentInvoices, smsLog, purchaseOrders, stockMovements, users, cashLogs, suppliers }}
+            setters={{ setCustomers, setProducts, setInvoices, setTxns, setPaymentInvoices, setSmsLog, setPurchaseOrders, setStockMovements, setUsers, setCashLogs, setSuppliers }}
             showToast={showToast} T={T} S={S}
           />
           <button style={{ ...S.cancelBtn, width:"100%", marginTop:10, color:"#22c55e", border:"1px solid #22c55e33" }}
@@ -18789,79 +17961,6 @@ function Settings_({ T, S, shopName,
             Close
           </button>
         </div>
-      )}
-
-      {/* Firebase Restore Modal */}
-      {showRestore && (
-        <div style={{ position:"fixed", inset:0, background:"#000000cc", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:20 }}>
-          <div style={{ background:T.card, borderRadius:20, padding:24, maxWidth:380, width:"100%", maxHeight:"90vh", overflowY:"auto" }}>
-            <div style={{ fontSize:28, textAlign:"center", marginBottom:6 }}>🗄️</div>
-            <div style={{ color:T.text, fontWeight:700, fontSize:15, textAlign:"center", marginBottom:4 }}>Firestore থেকে ডেটা পুনরুদ্ধার</div>
-            <div style={{ color:T.sub, fontSize:11, textAlign:"center", marginBottom:14 }}>Firestore-এর বর্তমান data এই ডিভাইসে টেনে আনবে</div>
-            <div style={{ background:"#0ea5e915", border:"1px solid #0ea5e930", borderRadius:10, padding:"10px 14px", marginBottom:14 }}>
-              {[
-                { icon:"👥", label:"Customers", val:customers.length },
-                { icon:"📦", label:"Products",  val:products.length },
-                { icon:"🧾", label:"Invoices",  val:invoices.length },
-                { icon:"💳", label:"Txns",      val:txns.length },
-              ].map(({ icon, label, val }) => (
-                <div key={label} style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-                  <span style={{ color:T.sub, fontSize:12 }}>{icon} {label}</span>
-                  <span style={{ color:T.text, fontWeight:700, fontSize:12 }}>{val}</span>
-                </div>
-              ))}
-            </div>
-            <div style={{ background:"#ef444415", border:"1px solid #ef444430", borderRadius:10, padding:"8px 12px", marginBottom:14, display:"flex", alignItems:"flex-start", gap:8 }}>
-              <span style={{ fontSize:16, flexShrink:0 }}>⚠️</span>
-              <div style={{ color:"#ef4444", fontSize:12, fontWeight:600 }}>Firestore-এর data দিয়ে এই ডিভাইসের local data replace হবে।</div>
-            </div>
-            <div style={{ display:"flex", gap:10 }}>
-              <button style={{ ...S.cancelBtn, flex:1 }} onClick={() => { setShowRestore(false); setRestoreSlot(null); }}>Cancel</button>
-              <button
-                style={{ ...S.saveBtn, flex:1, opacity:restoring?0.7:1, background:"#f9731622", color:"#f97316", border:"1px solid #f9731644" }}
-                disabled={restoring}
-                onClick={async () => {
-                  setRestoring(true);
-                  const result = await restoreFromFirebase();
-                  if (result.ok && result.data) {
-                    const d = result.data;
-                    if (d.customers)      setCustomers(d.customers);
-                    if (d.products)       setProducts(d.products);
-                    if (d.invoices)       setInvoices(d.invoices);
-                    if (d.txns)           setTxns(d.txns);
-                    if (d.smsLog)         setSmsLog(d.smsLog);
-                    if (d.paymentInvoices)setPaymentInvoices(d.paymentInvoices);
-                    if (d.purchaseOrders) setPurchaseOrders(d.purchaseOrders);
-                    if (d.stockMovements) setStockMovements(d.stockMovements);
-                    if (d.cashLogs)       setCashLogs(d.cashLogs);
-                    if (d.suppliers)      setSuppliers(d.suppliers);
-                    if (d.users && d.users.length) setUsers(d.users);
-                    setShowRestore(false); setRestoreSlot(null);
-                    showToast("🎉 Firestore থেকে ডেটা পুনরুদ্ধার সম্পন্ন!");
-                  } else {
-                    showToast(result.msg || "Firestore-এ কোনো ডেটা নেই", "#ef4444");
-                    setShowRestore(false);
-                  }
-                  setRestoring(false);
-                }}>
-                {restoring
-                  ? <span style={{display:"flex",alignItems:"center",gap:6,justifyContent:"center"}}>
-                      <span style={{animation:"hg-spin 1s linear infinite",display:"inline-block"}}>◌</span> আনছে...
-                    </span>
-                  : "✅ Restore"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Firebase Diagnostics (when FB ready) */}
-      {FB.isReady() && (
-        <FirebaseDiagnosticsCard
-          T={T} S={S} fbReady={FB.isReady()}
-          customers={customers} invoices={invoices}
-          txns={txns} products={products}
-        />
       )}
 
       {/* ⑤ SMS Template */}
@@ -19618,9 +18717,7 @@ function GoogleDriveSection({ data, setters, showToast, T, S }) {
   // 4. @capacitor/app AppUrlOpen event থেকে token পড়ো
   //
   const getFirebaseGoogleToken = useCallback(async () => {
-    // SBM Backup project Web Client ID
-    const WEB_CLIENT_ID = "822824220691-tk3bhouplkmuur7o4l1jhlqabdtkqs57.apps.googleusercontent.com";
-    return GDrive.interactiveAuth(WEB_CLIENT_ID);
+    return GDrive.interactiveAuth(GOOGLE_WEB_CLIENT_ID);
   }, []);
   useEffect(() => {
     const token = localStorage.getItem("sbm_gd_token");
@@ -19730,6 +18827,9 @@ function GoogleDriveSection({ data, setters, showToast, T, S }) {
       if (d.smsLog) setters.setSmsLog(d.smsLog);
       if (d.purchaseOrders) setters.setPurchaseOrders(d.purchaseOrders);
       if (d.stockMovements) setters.setStockMovements(d.stockMovements);
+      if (d.users) setters.setUsers?.(d.users);
+      if (d.cashLogs) setters.setCashLogs?.(d.cashLogs);
+      if (d.suppliers) setters.setSuppliers?.(d.suppliers);
       setStatus("success"); setStatusMsg(`ডেটা পুনরুদ্ধার সম্পন্ন ✓ (${valid.counts.customers} কাস্টমার, ${valid.counts.invoices} ইনভয়েস)`);
       showToast("♻️ Google Drive থেকে রিস্টোর সম্পন্ন!");
     } catch (e) {
@@ -20188,6 +19288,7 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
         invoices: d.invoices,   txns: d.txns,
         paymentInvoices: d.paymentInvoices, smsLog: d.smsLog,
         purchaseOrders: d.purchaseOrders, stockMovements: d.stockMovements,
+        users: d.users, cashLogs: d.cashLogs, suppliers: d.suppliers,
       });
       if (result.ok) setLastSync(new Date().toISOString());
     };
@@ -20207,6 +19308,7 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
       invoices:  data.invoices,  txns: data.txns,
       paymentInvoices: data.paymentInvoices, smsLog: data.smsLog,
       purchaseOrders: data.purchaseOrders, stockMovements: data.stockMovements,
+      users: data.users, cashLogs: data.cashLogs, suppliers: data.suppliers,
     });
     if (result.ok) {
       const now = new Date().toISOString();
@@ -20245,6 +19347,7 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
       invoices:  data.invoices,  txns: data.txns,
       paymentInvoices: data.paymentInvoices, smsLog: data.smsLog,
       purchaseOrders: data.purchaseOrders, stockMovements: data.stockMovements,
+      users: data.users, cashLogs: data.cashLogs, suppliers: data.suppliers,
       _exportedAt: new Date().toISOString(), _version: "4.0",
     };
     const filename = `sbm-backup-${new Date().toISOString().split("T")[0]}.json`;
@@ -20270,6 +19373,9 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
     if (snap.smsLog)    setters.setSmsLog(snap.smsLog);
     if (snap.purchaseOrders) setters.setPurchaseOrders(snap.purchaseOrders);
     if (snap.stockMovements) setters.setStockMovements(snap.stockMovements);
+    if (snap.users) setters.setUsers?.(snap.users);
+    if (snap.cashLogs) setters.setCashLogs?.(snap.cashLogs);
+    if (snap.suppliers) setters.setSuppliers?.(snap.suppliers);
     setStatus("success"); setStatusMsg(`স্ন্যাপশট রিস্টোর সম্পন্ন ✓ (${valid.counts.customers} কাস্টমার)`);
     setConfirmRestore(false);
     showToast("♻️ লোকাল স্ন্যাপশট রিস্টোর সম্পন্ন!");
@@ -20300,6 +19406,9 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
       if (d.smsLog) setters.setSmsLog(d.smsLog);
       if (d.purchaseOrders) setters.setPurchaseOrders(d.purchaseOrders);
       if (d.stockMovements) setters.setStockMovements(d.stockMovements);
+      if (d.users) setters.setUsers?.(d.users);
+      if (d.cashLogs) setters.setCashLogs?.(d.cashLogs);
+      if (d.suppliers) setters.setSuppliers?.(d.suppliers);
       setStatus("success"); setStatusMsg(`ফাইল রিস্টোর সম্পন্ন ✓ (${valid.counts.customers} কাস্টমার, ${valid.counts.invoices} ইনভয়েস)`);
       showToast("📁 ফাইল থেকে রিস্টোর সম্পন্ন!");
     } catch (err) {
@@ -20668,302 +19777,6 @@ function LocalStorageSection({ data, setters, showToast, T, S }) {
   );
 }
 
-// ─── Firebase Diagnostics Card ────────────────────────────────────────────────
-function FirebaseDiagnosticsCard({ T, S, fbReady, customers, invoices, txns, products }) {
-  const [latency, setLatency]           = React.useState(null);
-  const [testing, setTesting]           = React.useState(false);
-  const [queueSize, setQueueSize]       = React.useState(0);
-  const [connState, setConnState]       = React.useState("unknown");
-  const [syncLogs, setSyncLogs]         = React.useState([]);
-  const [showDebug, setShowDebug]       = React.useState(false);
-  const [lastCheck, setLastCheck]       = React.useState(null);
-  const [conflictLog, setConflictLog]   = React.useState([]);
-  const [showConflicts, setShowConflicts] = React.useState(false);
-  const [vcInfo, setVcInfo]             = React.useState({});
-
-  React.useEffect(() => {
-    const unsub = SyncLog.subscribe(logs => setSyncLogs(logs));
-    setSyncLogs(SyncLog.getAll());
-    DirtyQueue.size().then(setQueueSize);
-    setVcInfo(VectorClock.get());
-    setConflictLog(FB.getConflictLog());
-    return unsub;
-  }, []);
-
-  React.useEffect(() => {
-    const iv = setInterval(async () => {
-      setQueueSize(await DirtyQueue.size());
-      setConnState(FB.getConnectionState());
-      const lat = FB.getLatency();
-      if (lat !== null) setLatency(lat);
-      setConflictLog(FB.getConflictLog());
-      setVcInfo(VectorClock.get());
-    }, 10000);
-    return () => clearInterval(iv);
-  }, []);
-
-  const runDiagnostics = async () => {
-    setTesting(true);
-    const lat = await FB.measureLatency();
-    setLatency(lat);
-    setConnState(FB.getConnectionState());
-    setQueueSize(await DirtyQueue.size());
-    setLastCheck(new Date().toISOString());
-    setConflictLog(FB.getConflictLog());
-    setVcInfo(VectorClock.get());
-    SyncLog.add("info", lat ? `Latency: ${lat}ms` : "সংযোগ ব্যর্থ");
-    setTesting(false);
-  };
-
-  const totalRecords = (customers?.length||0) + (invoices?.length||0) + (txns?.length||0) + (products?.length||0);
-
-  const connColor    = connState === "online" ? "#22c55e" : connState === "offline" ? "#ef4444" : "#f59e0b";
-  const connLabel    = connState === "online" ? "অনলাইন"  : connState === "offline" ? "অফলাইন"  : "অজানা";
-  const latencyColor = latency === null ? "#64748b" : latency < 200 ? "#22c55e" : latency < 600 ? "#f59e0b" : "#ef4444";
-
-  if (!fbReady) return null;
-
-  return (
-    <div style={{
-      background: "linear-gradient(135deg,#0a1628 0%,#0f172a 100%)",
-      borderRadius: 20, border: "1.5px solid #4285F433",
-      overflow: "hidden", marginBottom: 12,
-    }}>
-      {/* Header */}
-      <div style={{ padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 36, height: 36, borderRadius: 10, background: "#4285F422", border: "1px solid #4285F444", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>
-            🔥
-          </div>
-          <div>
-            <div style={{ color: "#e2e8f0", fontWeight: 800, fontSize: 13, display: "flex", alignItems: "center", gap: 7 }}>
-              Firebase ডায়াগনস্টিক্স
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: connColor, display: "inline-block", boxShadow: `0 0 6px ${connColor}` }} />
-            </div>
-            <div style={{ color: "#475569", fontSize: 10, marginTop: 1 }}>
-              {lastCheck ? `শেষ চেক: ${new Date(lastCheck).toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit"})}` : "চেক করা হয়নি"}
-            </div>
-          </div>
-        </div>
-        <button
-          onClick={runDiagnostics}
-          disabled={testing}
-          style={{ background: "#4285F422", border: "1px solid #4285F444", borderRadius: 10, padding: "7px 14px", color: "#4285F4", fontSize: 12, fontWeight: 800, cursor: testing ? "not-allowed" : "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 5, opacity: testing ? 0.7 : 1 }}>
-          {testing ? <span style={{ animation: "hg-spin 1s linear infinite", display: "inline-block" }}>◌</span> : "🔍"} {testing ? "..." : "চেক করুন"}
-        </button>
-      </div>
-
-      {/* Stats grid */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, padding: "0 16px 14px" }}>
-        {[
-          { label: "সংযোগ", val: connLabel, color: connColor },
-          { label: "লেটেন্সি", val: latency !== null ? latency + "ms" : "—", color: latencyColor },
-          { label: "Pending", val: queueSize, color: queueSize > 0 ? "#f59e0b" : "#22c55e" },
-          { label: "Records", val: totalRecords.toLocaleString(), color: "#4285F4" },
-        ].map(({ label, val, color }) => (
-          <div key={label} style={{ background: "#0d1f3c", borderRadius: 10, padding: "8px 6px", textAlign: "center", border: "1px solid #1e3a5f" }}>
-            <div style={{ color, fontWeight: 900, fontSize: 14 }}>{val}</div>
-            <div style={{ color: "#475569", fontSize: 9, marginTop: 2 }}>{label}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Debug panel toggle */}
-      <div style={{ borderTop: "1px solid #1e3a5f" }}>
-        <button
-          onClick={() => setShowDebug(v => !v)}
-          style={{ width: "100%", background: "none", border: "none", padding: "10px 16px", color: "#475569", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 6, justifyContent: "center" }}>
-          {showDebug ? "▲ Debug Panel বন্ধ করুন" : "▼ Debug Panel দেখুন"}
-          {syncLogs.some(l => l.type === "error") && (
-            <span style={{ background: "#ef444422", border: "1px solid #ef444444", borderRadius: 6, padding: "1px 6px", color: "#ef4444", fontSize: 10 }}>
-              ⚠️ error
-            </span>
-          )}
-        </button>
-
-        {showDebug && (
-          <div style={{ padding: "0 14px 14px", animation: "hg-slide-in 0.2s ease" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700 }}>Sync Logs ({syncLogs.length}) <span style={{ color: "#475569", fontWeight: 400 }}>· ৭ দিন সংরক্ষিত</span></div>
-              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <span style={{ background: "#22c55e22", border: "1px solid #22c55e44", borderRadius: 6, padding: "2px 7px", color: "#22c55e", fontSize: 10, fontWeight: 700 }}>
-                  Queue: {queueSize}
-                </span>
-                {/* Export logs as JSON file */}
-                <button
-                  onClick={async () => {
-                    const history = await SyncLog.getHistory(7);
-                    const blob = new Blob([JSON.stringify(history, null, 2)], { type: "application/json" });
-                    const url  = URL.createObjectURL(blob);
-                    const a    = document.createElement("a");
-                    a.href     = url;
-                    a.download = `hg-synclog-${new Date().toISOString().split("T")[0]}.json`;
-                    a.click();
-                    setTimeout(() => URL.revokeObjectURL(url), 2000);
-                  }}
-                  title="Export full log history"
-                  style={{ background: "#4285F422", border: "1px solid #4285F444", borderRadius: 6, padding: "2px 7px", color: "#4285F4", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
-                  ⬇ Export
-                </button>
-                {/* Clear all logs */}
-                <button
-                  onClick={async () => {
-                    await SyncLog.clear();
-                    setSyncLogs([]);
-                    SyncLog.add("info", "Logs cleared by user");
-                  }}
-                  title="Clear all logs"
-                  style={{ background: "#ef444415", border: "1px solid #ef444433", borderRadius: 6, padding: "2px 7px", color: "#ef4444", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
-                  🗑 Clear
-                </button>
-              </div>
-            </div>
-            <div style={{ background: "#060d18", borderRadius: 12, border: "1px solid #1e3a5f", maxHeight: 200, overflowY: "auto", fontFamily: "monospace", fontSize: 11 }}>
-              {syncLogs.length === 0 ? (
-                <div style={{ color: "#475569", textAlign: "center", padding: "14px 0" }}>কোনো log নেই</div>
-              ) : syncLogs.map(entry => {
-                const typeColor = { sync: "#22c55e", error: "#ef4444", queue: "#f59e0b", merge: "#a78bfa", info: "#4285F4" }[entry.type] || "#94a3b8";
-                const typeIcon  = { sync: "✓", error: "✗", queue: "⏳", merge: "⇄", info: "ℹ" }[entry.type] || "·";
-                const d = new Date(entry.at);
-                const isToday = d.toDateString() === new Date().toDateString();
-                return (
-                  <div key={entry.id} style={{ padding: "5px 10px", borderBottom: "1px solid #0d1f3c", display: "flex", gap: 8 }}>
-                    <span style={{ color: typeColor, fontWeight: 900, flexShrink: 0 }}>{typeIcon}</span>
-                    <span style={{ color: "#94a3b8", flexShrink: 0, fontSize: 10, whiteSpace: "nowrap" }}>
-                      {isToday
-                        ? d.toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
-                        : d.toLocaleDateString("en", { month: "short", day: "numeric" }) + " " + d.toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" })
-                      }
-                    </span>
-                    <span style={{ color: "#e2e8f0" }}>{entry.msg}</span>
-                  </div>
-                );
-              })}
-            </div>
-            {/* Clear queue button */}
-            {queueSize > 0 && (
-              <button
-                onClick={async () => { await DirtyQueue.clear(); setQueueSize(0); SyncLog.add("info", "Queue manually cleared"); }}
-                style={{ marginTop: 8, width: "100%", background: "#ef444415", border: "1px solid #ef444433", borderRadius: 10, padding: "8px", color: "#ef4444", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
-                🗑️ Pending Queue মুছুন ({queueSize}টি)
-              </button>
-            )}
-
-            {/* Vector Clock Info */}
-            {Object.keys(vcInfo).length > 0 && (
-              <div style={{ marginTop: 10, background: "#060d18", borderRadius: 10, border: "1px solid #1e3a5f", padding: "8px 10px" }}>
-                <div style={{ color: "#475569", fontSize: 10, fontWeight: 700, marginBottom: 5 }}>⏱ Vector Clock (এই ডিভাইস)</div>
-                {Object.entries(vcInfo).map(([devId, cnt]) => (
-                  <div key={devId} style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 10, color: devId === DeviceID.get() ? "#4285F4" : "#64748b", padding: "2px 0" }}>
-                    <span>{devId === DeviceID.get() ? "★ " : ""}{devId.slice(0, 16)}...</span>
-                    <span style={{ color: "#94a3b8", fontWeight: 700 }}>v{cnt}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Conflict Log */}
-            <div style={{ marginTop: 10 }}>
-              <button
-                onClick={() => setShowConflicts(v => !v)}
-                style={{ width: "100%", background: "none", border: "1px solid #1e3a5f", borderRadius: 8, padding: "6px 10px", color: conflictLog.length > 0 ? "#a78bfa" : "#475569", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", display: "flex", justifyContent: "space-between" }}>
-                <span>⇄ Conflict Resolution Log ({conflictLog.length})</span>
-                <span>{showConflicts ? "▲" : "▼"}</span>
-              </button>
-              {showConflicts && (
-                <div style={{ marginTop: 6, background: "#060d18", borderRadius: 10, border: "1px solid #1e3a5f", maxHeight: 160, overflowY: "auto" }}>
-                  {conflictLog.length === 0 ? (
-                    <div style={{ color: "#475569", fontSize: 11, textAlign: "center", padding: "10px 0" }}>কোনো conflict হয়নি ✓</div>
-                  ) : conflictLog.map((c, i) => (
-                    <div key={i} style={{ padding: "6px 10px", borderBottom: "1px solid #0d1f3c", fontFamily: "monospace", fontSize: 10 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                        <span style={{ color: "#a78bfa", fontWeight: 700 }}>[{c.collection}] {c.id?.slice(0,8)}...</span>
-                        <span style={{ color: "#64748b" }}>{new Date(c.at).toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit"})}</span>
-                      </div>
-                      <div style={{ color: "#94a3b8" }}>
-                        strategy: <span style={{ color: "#22c55e" }}>{c.resolution}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── Master Component ─────────────────────────────────────────────────────────
-/**
- * BackupRestoreSystem — Main component to use in Settings tab
- *
- * Props:
- *  T, S          — theme tokens and style objects from App.jsx
- *  customers, products, invoices, txns, paymentInvoices, smsLog
- *                — current app data
- *  setCustomers, setProducts, setInvoices, setTxns,
- *  setPaymentInvoices, setSmsLog
- *                — state setters
- *  showToast     — toast notification function
- */
-function BackupRestoreSystem({
-  T, S,
-  customers = [], products = [], invoices = [], txns = [],
-  paymentInvoices = [], smsLog = [],
-  setCustomers, setProducts, setInvoices, setTxns,
-  setPaymentInvoices, setSmsLog,
-  showToast,
-  fbReady = false,
-}) {
-  const data = { customers, products, invoices, txns, paymentInvoices, smsLog };
-  const setters = { setCustomers, setProducts, setInvoices, setTxns, setPaymentInvoices, setSmsLog };
-
-  return (
-    <>
-      <style>{ANIM_CSS}</style>
-
-      {/* Section title */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 10,
-        marginBottom: 4,
-      }}>
-        <div style={{
-          width: 3, height: 20, borderRadius: 100,
-          background: "linear-gradient(to bottom, #4285F4, #22c55e)",
-        }} />
-        <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 800, letterSpacing: 1.5, textTransform: "uppercase" }}>
-          ব্যাকআপ ও পুনরুদ্ধার
-        </div>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {/* Firebase Diagnostics Card — always show if FB ready */}
-        {fbReady && (
-          <FirebaseDiagnosticsCard
-            T={T} S={S}
-            fbReady={fbReady}
-            customers={customers} invoices={invoices}
-            txns={txns} products={products}
-          />
-        )}
-
-        <GoogleDriveSection
-          data={data} setters={setters}
-          showToast={showToast} T={T} S={S}
-        />
-        <LocalStorageSection
-          data={data} setters={setters}
-          showToast={showToast} T={T} S={S}
-        />
-      </div>
-    </>
-  );
-}
-
-
-
 // ─── Backup Validation Helper ────────────────────────────────────────────────
 function validateBackup(data) {
   if (!data || typeof data !== "object") return { ok: false, msg: "ব্যাকআপ ডেটা পাওয়া যায়নি" };
@@ -21029,6 +19842,16 @@ const GDrive = {
     }
   },
 
+  // 🔇 Background timer-এর জন্য — কখনো manual-auth UI দেখায় না, শুধু silent
+  // চেষ্টা করে; fail হলে null ফেরত দেয় (timer পরের cycle-এ আবার চেষ্টা করবে)
+  async ensureTokenSilent(clientId) {
+    const existing = await this.getToken();
+    if (existing && !this.isTokenExpired()) return existing;
+    const fresh = await this.silentReauth(clientId);
+    if (fresh) await this.saveToken(fresh);
+    return fresh;
+  },
+
   // ── Direct OAuth2 implicit flow — GIS library লাগে না ──────────────────
   // Capacitor WebView-এ accounts.google.com block হয় তাই
   // window.open() দিয়ে system browser-এ OAuth করা হয়
@@ -21036,7 +19859,7 @@ const GDrive = {
     "https://www.googleapis.com/auth/drive.file",
   ].join(" "),
 
-  _buildAuthUrl(clientId, state) {
+  _buildAuthUrl(clientId, state, silent = false) {
     // Netlify-তে hosted oauth.html → token parse করে app-এ deep link পাঠায়
     const OAUTH_REDIRECT = "https://melodious-axolotl-00b2e7.netlify.app/oauth.html";
     const redirectUri = window.Capacitor?.isNativePlatform?.()
@@ -21050,14 +19873,18 @@ const GDrive = {
       state,
       include_granted_scopes: "true",
     });
+    // silent re-auth: ব্রাউজারে আগে থেকে Google সেশন/অনুমতি থাকলে কোনো UI
+    // ছাড়াই token ফিরে আসে; না থাকলে দ্রুত error-এ ফিরে আসে (UI দেখায় না)
+    if (silent) params.set("prompt", "none");
     return "https://accounts.google.com/o/oauth2/v2/auth?" + params.toString();
   },
 
-  async interactiveAuth(clientId) {
+  async interactiveAuth(clientId, { silent = false } = {}) {
     return new Promise((resolve, reject) => {
       const state = Math.random().toString(36).slice(2);
       localStorage.setItem("sbm_gd_oauth_state", state);
-      const url = GDrive._buildAuthUrl(clientId, state);
+      const url = GDrive._buildAuthUrl(clientId, state, silent);
+      const authTimeout = silent ? 15000 : 180000; // silent হলে দ্রুত fail করো, UI ব্লক করবে না
 
       // APK: Chrome Custom Tab + appUrlOpen deep link
       if (window.Capacitor?.isNativePlatform?.()) {
@@ -21107,11 +19934,11 @@ const GDrive = {
 
         Browser.open({ url, windowName: "_blank" });
 
-        // 3 মিনিট timeout
+        // silent হলে ১৫ সেকেন্ড, না হলে ৩ মিনিট timeout
         setTimeout(() => {
           cleanup();
-          reject(new Error("Auth timeout — আবার চেষ্টা করুন"));
-        }, 180000);
+          reject(new Error(silent ? "Silent re-auth ব্যর্থ" : "Auth timeout — আবার চেষ্টা করুন"));
+        }, authTimeout);
         return;
       }
 
@@ -21137,6 +19964,17 @@ const GDrive = {
 
   async requestNewToken(clientId) {
     return this.interactiveAuth(clientId);
+  },
+
+  // 🔇 Background timer থেকে কল হয় — UI ছাড়া token refresh-এর চেষ্টা করে।
+  // ব্রাউজারে আগে থেকে Google session/consent থাকলে নিঃশব্দে নতুন token পাওয়া
+  // যায়; না থাকলে দ্রুত fail করে (এই cycle skip, পরের cycle-এ আবার চেষ্টা)।
+  async silentReauth(clientId) {
+    try {
+      return await this.interactiveAuth(clientId, { silent: true });
+    } catch {
+      return null;
+    }
   },
 
   // ── Gzip compression helper (CompressionStream API — Chrome 80+, Android WebView 94+)
@@ -21322,24 +20160,21 @@ const GDrive = {
   },
 
   async getBackupInfo(token) {
-    // Search both compressed (.json.gz) and plain (.json) — try gz first
-    // "SBM Backups" visible folder-এ খুঁজতে হবে (appDataFolder নয়)
+    // ফিক্স: আগে ভুলভাবে spaces=appDataFolder ব্যবহার করত — কিন্তু আমরা
+    // drive.file স্কোপ দিয়ে ভিজিবল "SBM Backups" ফোল্ডারে আপলোড করি,
+    // appDataFolder (hidden) স্পেসে না। তাই সঠিক ফোল্ডার থেকেই খুঁজি।
     try {
-      const folderId = await this._ensureFolder(token);
-      const names = [this.BACKUP_FILENAME + ".gz", this.BACKUP_FILENAME];
-      for (const name of names) {
-        const q = encodeURIComponent(`name="${name}" and "${folderId}" in parents and trashed=false`);
-        const r = await fetch(
-          `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,size)&orderBy=modifiedTime+desc`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        if (!r.ok) continue;
-        const data = await r.json();
-        const file = data.files?.[0];
-        if (file) return file;
-      }
-    } catch {}
-    return null;
+      const fileId = await this.findBackupFile(token);
+      if (!fileId) return null;
+      const r = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,modifiedTime,size`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!r.ok) return null;
+      return await r.json();
+    } catch {
+      return null;
+    }
   },
 
   // 🗑️ Master Delete — Google Drive-এর "SBM Backups" ফোল্ডারে থাকা ব্যাকআপ
