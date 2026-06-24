@@ -9795,6 +9795,11 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
   const total     = subtotal - discAmt + extraAmt;
   const paidAmt = payType === "partial" ? (parseFloat(partialAmt) || 0) : (payType === "cash" ? total : 0);
   const bakiAmt = total - paidAmt;
+  // Overpayment split: পরিশোধ > আজকের invoice → অতিরিক্ত অংশ কাস্টমারের জমা হবে
+  const prevBalance = (!selCust || selCust.id === "__walkin__" || selCust.id === "__selfuse__") ? 0 : (selCust.balance || 0);
+  const isOverpay = payType === "partial" && paidAmt > total && prevBalance > 0;
+  const overpayAmt = isOverpay ? Math.min(paidAmt - total, prevBalance) : 0;
+  const newBalance = prevBalance + bakiAmt - overpayAmt;
 
   const resetAll = () => {
     setStep(1); setSelCust(null); setCustSearch(""); setItems([]);
@@ -9974,14 +9979,23 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
     });
 
     if (!isWalkIn && !isSelfUse && (effectivePayType === "baki" || effectivePayType === "partial")) {
-      const newBal = selCust.balance + bakiAmt;
-      setCustomers(prev => prev.map(c => c.id === selCust.id ? { ...c, balance: newBal } : c));
-      addTxn(selCust.id, "baki", bakiAmt, newBal, inv.id, note);
-      // Bug fix: partial payment-এ নগদ অংশের জমার রশিদ তৈরি করো
+      // Overpayment: paid > total → অতিরিক্ত অংশ কাস্টমারের আগের বাকি থেকে বাদ যাবে (জমা)
+      const _prevBal = selCust.balance || 0;
+      const _isOverpay = effectivePayType === "partial" && paidAmt > total && _prevBal > 0;
+      const _overpayAmt = _isOverpay ? Math.min(paidAmt - total, _prevBal) : 0;
+      const newBal = _prevBal + bakiAmt - _overpayAmt;
+      setCustomers(prev => prev.map(c => c.id === selCust.id ? { ...c, balance: Math.max(0, newBal) } : c));
+      if (bakiAmt > 0) addTxn(selCust.id, "baki", bakiAmt, Math.max(0, newBal), inv.id, note);
+      // partial payment: নগদ অংশ joma txn
       if (effectivePayType === "partial" && paidAmt > 0) {
-        // Bug fix: also record the cash portion as a "joma" txn so cash flow is tracked
-        addTxn(selCust.id, "joma", paidAmt, newBal, inv.id, `আংশিক নগদ — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, null, "partial-sale");
-        createPaymentInvoice({ ...selCust, balance: newBal }, paidAmt, `আংশিক জমা — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, "partial-sale");
+        const cashPortion = Math.min(paidAmt, total); // শুধু invoice পর্যন্ত নগদ
+        addTxn(selCust.id, "joma", cashPortion, Math.max(0, newBal), inv.id, `আংশিক নগদ — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, null, "partial-sale");
+        createPaymentInvoice({ ...selCust, balance: Math.max(0, newBal) }, cashPortion, `আংশিক জমা — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, "partial-sale");
+        // Overpayment অংশ আগের বাকি আদায় হিসেবে joma
+        if (_overpayAmt > 0) {
+          addTxn(selCust.id, "joma", _overpayAmt, Math.max(0, newBal), inv.id, `অতিরিক্ত জমা (আগের বাকি আদায়) — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, null, "overpay");
+          createPaymentInvoice({ ...selCust, balance: Math.max(0, newBal) }, _overpayAmt, `বাকি আদায় — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, "overpay");
+        }
       }
       await Haptic.heavy();
       // বাকির due date থাকলে reminder schedule করো
@@ -10254,28 +10268,34 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
               placeholder={`নাম, মোবাইল বা সিরিয়াল নম্বর... (${customers.length}জন)`}
               defaultValue={custSearch}
               ref={el => {
-                if (el && !el._b) {
-                  el._b = true;
-
-
-
-                  el.addEventListener("compositionend", e => { setCustSearch(e.target.value); }, { passive: true });
-                  el.addEventListener("input", e => { setCustSearch(e.target.value); }, { passive: true });
-
-                  el.addEventListener("keydown", e => { if (e.key === "Escape") { el.value = ""; setCustSearch(""); } }, { passive: true });
-                }
+                if (!el) return;
+                window._sbmCustSearchEl = el;
+                if (el._b) return;
+                el._b = true;
+                el.addEventListener("compositionend", e => { setCustSearch(e.target.value); }, { passive: true });
+                el.addEventListener("input", e => { setCustSearch(e.target.value); }, { passive: true });
+                el.addEventListener("keydown", e => { if (e.key === "Escape") { el.value = ""; setCustSearch(""); } }, { passive: true });
               }}
               onChange={()=>{}}
               autoCorrect="off" autoCapitalize="off" spellCheck={false}
             />
             {custSearch && (
               <button style={{ background: "#f9731622", border: "none", color: "#f97316", cursor: "pointer", borderRadius: 8, width: 24, height: 24, fontSize: 11, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}
-                onClick={() => setCustSearch("")}>✕</button>
+                onPointerDown={e => e.preventDefault()}
+                onClick={() => {
+                  setCustSearch("");
+                  const el = window._sbmCustSearchEl;
+                  if (el) { el.value = ""; el.focus(); }
+                }}>✕</button>
             )}
-            <VoiceSearchButton onResult={v => setCustSearch(v)} color="#f97316" />
+            <VoiceSearchButton onResult={v => {
+              setCustSearch(v);
+              const el = window._sbmCustSearchEl;
+              if (el) el.value = v;
+            }} color="#f97316" />
           </div>
 
-          {/* Scrollable Customer List Box */}
+          {/* Scrollable Customer List Box — keyboard উঠলে list উপরে scroll করা যায় */}
           <div style={{
             overflowY: "auto",
             flex: 1,
@@ -10285,7 +10305,7 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
             background: T.bg === "#f8fafc"
               ? "linear-gradient(160deg,#fff7ed 0%,#ffedd5 60%,#fffbf7 100%)"
               : "linear-gradient(160deg,#1c0e0066 0%,#2a120066 50%,#0d0d0d44 100%)",
-            padding: "6px 8px calc(130px + env(safe-area-inset-bottom, 0px)) 8px",
+            padding: "6px 8px 16px 8px",
             marginBottom: 4,
             boxShadow: T.bg === "#f8fafc" ? "inset 0 2px 8px rgba(249,115,22,0.06)" : "none",
           }}>
@@ -10953,24 +10973,48 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
               </div>
             )}
 
-            {/* Summary row */}
+            {/* Summary row — নতুন: মোট খরচ / পরিশোধ পদ্ধতি / পূর্বের বাকি / বর্তমান বাকি */}
             {!isSelfUse && (
             <div className="qc-gradient-card" style={{ ...S.card, marginBottom: 10 }}>
-              <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, color: T.sub, marginBottom:4 }}>
-                <span>নেট মোট</span><span style={{ color: T.text, fontWeight:800 }}>৳{fmt(total)}</span>
+              {/* মোট খরচ */}
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, color: T.sub, marginBottom:6 }}>
+                <span>মোট খরচ</span>
+                <span style={{ color: T.text, fontWeight:800 }}>৳{fmt(total)}</span>
               </div>
-              <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, color: T.sub }}>
+              {/* পরিশোধ পদ্ধতি */}
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, color: T.sub, marginBottom: (prevBalance > 0 || bakiAmt > 0) ? 6 : 0 }}>
                 <span>পরিশোধ পদ্ধতি</span>
                 <span style={{ color: (selCust?.id==="__walkin__"||payType==="cash")?"#22c55e":payType==="baki"?"#ef4444":"#f59e0b", fontWeight:800 }}>
                   {selCust?.id === "__walkin__"
-                    ? walkInPayType === "baki"
-                      ? `পুরো বাকি ৳${fmt(total)}`
-                      : walkInPayType === "partial"
-                      ? `আংশিক — বাকি ৳${fmt(total-(parseFloat(walkInPartialAmt)||0))}`
+                    ? walkInPayType === "baki" ? `বাকি ৳${fmt(total)}`
+                      : walkInPayType === "partial" ? `আংশিক — নগদ ৳${fmt(parseFloat(walkInPartialAmt)||0)}`
                       : "নগদ পরিশোধ"
-                    : payType==="baki" ? `বাকি ৳${fmt(total)}` : payType==="partial" ? `আংশিক — বাকি ৳${fmt(total-(parseFloat(partialAmt)||0))}` : "নগদ পরিশোধ"}
+                    : payType==="baki" ? `বাকি ৳${fmt(total)}`
+                    : payType==="partial" ? `আংশিক — নগদ ৳${fmt(paidAmt)}`
+                    : "নগদ পরিশোধ"}
                 </span>
               </div>
+              {/* পূর্বের বাকি — শুধু registered customer, walk-in নয় */}
+              {selCust && selCust.id !== "__walkin__" && selCust.id !== "__selfuse__" && prevBalance > 0 && (
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, color: T.sub, marginBottom:6 }}>
+                  <span>পূর্বের বাকি</span>
+                  <span style={{ color:"#f59e0b", fontWeight:800 }}>৳{fmt(prevBalance)}</span>
+                </div>
+              )}
+              {/* Overpayment info */}
+              {isOverpay && overpayAmt > 0 && (
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"#22c55e", marginBottom:6, background:"#22c55e11", borderRadius:8, padding:"4px 8px" }}>
+                  <span>বাকি আদায় (অতিরিক্ত জমা)</span>
+                  <span style={{ fontWeight:800 }}>৳{fmt(overpayAmt)}</span>
+                </div>
+              )}
+              {/* বর্তমান বাকি */}
+              {selCust && selCust.id !== "__walkin__" && selCust.id !== "__selfuse__" && (prevBalance > 0 || bakiAmt > 0) && (
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, borderTop:`1px solid ${T.border}`, paddingTop:6, marginTop:2 }}>
+                  <span style={{ color: T.sub }}>বর্তমান বাকি</span>
+                  <span style={{ color: newBalance > 0 ? "#ef4444" : "#22c55e", fontWeight:900 }}>৳{fmt(Math.max(0, newBalance))}</span>
+                </div>
+              )}
             </div>
             )}
 
@@ -13302,6 +13346,10 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
       const allItems    = dashModal.allItems || dashModal.items || [];
       const rangedItems = allItems.filter(inv => dmRange.inRange(inv.dateKey));
       const rangeTotal  = rangedItems.reduce((s, i) => s + (i.total || 0), 0);
+      // নগদ বিক্রয় modal-এ admin-only মোট লাভ/লস
+      const _isCashModal = dashModal.baseTitle === "নগদ বিক্রয়ের ইনভয়েস";
+      const _cashProdMap = new Map(products.map(p => [p.id, p]));
+      const _cashProfit  = _isCashModal ? calcProfitTotal(rangedItems, _cashProdMap) : 0;
       const pdfHtml = buildPdfHtml(
         buildDailyListHtml(rangedItems, "invoices", shopName),
         shopName, `${dashModal.baseTitle || dashModal.title} — ${dmRange.label}`
@@ -13315,6 +13363,30 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
           <div style={{ color: T.text, fontWeight: 700, fontSize: 16, marginBottom: 10 }}>{dashModal.baseTitle || dashModal.title}</div>
           {/* তারিখ রেঞ্জ সিলেক্টর */}
           <DashModalDateRangePicker hook={dmRange} accentColor="#1fd15e" T={T} />
+          {/* Admin-only: নগদ বিক্রয়ে মোট লাভ/লস banner */}
+          {_isCashModal && currentUser?.role !== "staff" && rangedItems.length > 0 && (
+            <div style={{
+              display:"flex", justifyContent:"space-between", alignItems:"center",
+              background: _cashProfit >= 0 ? "linear-gradient(135deg,#14532d,#15803d)" : "linear-gradient(135deg,#7f1d1d,#b91c1c)",
+              borderRadius:14, padding:"12px 16px", marginBottom:10,
+              border: `1.5px solid ${_cashProfit >= 0 ? "#22c55e44" : "#ef444444"}`,
+            }}>
+              <div>
+                <div style={{ color:"rgba(255,255,255,0.7)", fontSize:11, fontWeight:700, marginBottom:2 }}>নগদ বিক্রয়ে মোট</div>
+                <div style={{ color:"#fff", fontWeight:900, fontSize:22, letterSpacing:-0.5 }}>
+                  {_cashProfit >= 0 ? "+" : "−"}৳{fmt(Math.abs(Number(_cashProfit.toFixed(2))))}
+                </div>
+              </div>
+              <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, padding:"6px 14px", textAlign:"center" }}>
+                <div style={{ color:"rgba(255,255,255,0.8)", fontSize:10, fontWeight:700 }}>
+                  {_cashProfit >= 0 ? "🟢 মোট লাভ" : "🔴 মোট লস"}
+                </div>
+                <div style={{ color:"#fff", fontSize:12, fontWeight:800, marginTop:2 }}>
+                  {rangedItems.length}টি ইনভয়েস
+                </div>
+              </div>
+            </div>
+          )}
           {/* সারসংক্ষেপ */}
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
             <div style={{ color: T.sub, fontSize: 12 }}>{rangedItems.length}টি ইনভয়েস · মোট: <b style={{ color:"#4ade80" }}>৳{fmt(rangeTotal)}</b></div>
@@ -13624,7 +13696,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
               onClick: () => setDashModal({ title:`${repLabel} বাকির ইনভয়েস`, baseTitle:"বাকির ইনভয়েস", type:"invoices", items:repData.bakiInvs, allItems: invoices.filter(i => i.status !== "voided" && (i.payType === "baki" || (i.payType === "partial" && i.bakiAmount > 0))) })
             },
             {
-              label:"", value:`৳${fmt(Math.max(0, repData.profit))}`,
+              label:"", value:`৳${fmt(repData.profit)}`,
               idx:3,
               sub:"",
               iconPath: <><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></>,
