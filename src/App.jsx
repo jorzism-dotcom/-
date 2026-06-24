@@ -7543,7 +7543,7 @@ function SmartBusinessMgmt() {
         const revenue       = todayInvList.reduce((s, i) => s + (i.total || 0), 0);
         const cashSale      = todayInvList.reduce((s, i) => {
           if (i.payType === "cash") return s + (i.total || 0);
-          if (i.payType === "partial") return s + (i.paidAmount || 0);
+          if (i.payType === "partial") return s + Math.min(i.paidAmount || 0, i.total || 0);
           return s;
         }, 0);
         const _voidedIds1   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
@@ -7861,7 +7861,7 @@ function SmartBusinessMgmt() {
   const totalBaki  = useMemo(() => customers.reduce((s, c) => s + (c.balance || 0), 0), [customers]);
   const todayCashSale = useMemo(() => todayInvs.reduce((s, i) => {
     if (i.payType === "cash") return s + i.total;
-    if (i.payType === "partial") return s + (i.paidAmount || 0);
+    if (i.payType === "partial") return s + Math.min(i.paidAmount || 0, i.total || 0);
     return s;
   }, 0), [todayInvs]);
   const todayProfit = useMemo(() => {
@@ -9641,7 +9641,7 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
   const [catFilter,  setCatFilter]  = useState("সব");
   const [prodSearch, setProdSearch] = useState("");
   const [prodPage,   setProdPage]   = useState(1); // Invoice Step2 product pagination
-  const [payType,    setPayType]    = useState("baki");
+  const [payType,    setPayType]    = useState("cash");
   const [partialAmt, setPartialAmt] = useState("");
   const [dueDate,    setDueDate]    = useState(""); // বাকির পরিশোধের তারিখ
   const [walkInPayType,    setWalkInPayType]    = useState("cash"); // walk-in: cash | partial
@@ -13579,7 +13579,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
         const total = invs.reduce((s, i) => s + (i.total || 0), 0);
         const cashSale = invs.reduce((s, i) => {
           if (i.payType === "cash") return s + (i.total || 0);
-          if (i.payType === "partial") return s + (i.paidAmount || 0);
+          if (i.payType === "partial") return s + Math.min(i.paidAmount || 0, i.total || 0);
           return s;
         }, 0);
         const voidedInvIds = new Set(invoices.filter(i => i.status === "voided").map(i => i.id));
@@ -13757,7 +13757,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
                 const _prodMap = new Map(products.map(p => [p.id, p]));
                 const _rows = calcProfitByProduct(repData.invs || [], _prodMap, products);
                 const _totalProfit = _rows.filter(r => r.profit > 0).reduce((s,r) => s + r.profit, 0);
-                const _totalLoss   = _rows.filter(r => r.profit < 0).reduce((s,r) => s + r.profit, 0);
+                const _totalLoss   = _rows.filter(r => r.profit <= 0).reduce((s,r) => s + r.profit, 0);
                 const _net = _totalProfit + _totalLoss;
                 const lossAccent = DT.mono[5]; // লস সবসময় নিউট্রাল/সতর্কতামূলক ধূসর-লাল টোনে
                 const profitCol = DT.dark ? cAccent : "#fff";
@@ -16306,7 +16306,7 @@ function DailyNotifCard({ S, T = {}, shopName, showToast, customers = [], invoic
     const revenue       = todayInvList.reduce((s, i) => s + (i.total || 0), 0);
     const cashSale      = todayInvList.reduce((s, i) => {
       if (i.payType === "cash") return s + (i.total || 0);
-      if (i.payType === "partial") return s + (i.paidAmount || 0);
+      if (i.payType === "partial") return s + Math.min(i.paidAmount || 0, i.total || 0);
       return s;
     }, 0);
     const _voidedIds2   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
