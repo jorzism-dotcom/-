@@ -5105,6 +5105,44 @@ const calcProfitByProduct = (invList, prodMap, productsFallback = []) => {
   return Object.values(map);
 };
 
+// invoice-level breakdown grouped by product with accordion support
+// প্রতিটি পণ্যের জন্য: লাভ section ও লস section আলাদা, invoice list সহ, কারণ সহ
+const calcProfitByProductWithInvoices = (invList, prodMap, productsFallback = []) => {
+  // profitMap: { productKey -> { name, profitInvs: [{invId, invNo, qty, profit, reason}], lossInvs: [...] } }
+  const map = {};
+  invList.forEach(inv => {
+    const items = inv.items || [];
+    const subtotal = items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0);
+    const discountRatio = subtotal > 0 ? (inv.total || 0) / subtotal : 1;
+    const discountAmt = subtotal - (inv.total || 0);
+    items.forEach(item => {
+      const qty = item.qty || 1;
+      const p = prodMap?.get?.(item.productId) || productsFallback.find(pr => pr.name === item.name);
+      const cost = _itemCostPrice(item, prodMap) * qty;
+      const revenue = (item.price || 0) * qty * discountRatio;
+      const profit = revenue - cost;
+      const key = item.productId || item.name;
+      const displayName = p?.name || item.name;
+      if (!map[key]) map[key] = { name: displayName, profitInvs: [], lossInvs: [], totalProfit: 0, totalLoss: 0 };
+      map[key].name = displayName;
+      // কারণ নির্ধারণ
+      let reason = "স্বাভাবিক বিক্রয়";
+      if (discountAmt > 0 && profit < 0) reason = `ডিসকাউন্ট ৳${Math.round(discountAmt)} এর কারণে লস`;
+      else if (discountAmt > 0) reason = `ডিসকাউন্ট ৳${Math.round(discountAmt)} বাদে`;
+      else if (profit < 0) reason = "ক্রয়মূল্য বেশি";
+      const entry = { inv, invNo: inv.invoiceNo || inv.id, qty, profit, reason };
+      if (profit >= 0) {
+        map[key].profitInvs.push(entry);
+        map[key].totalProfit += profit;
+      } else {
+        map[key].lossInvs.push(entry);
+        map[key].totalLoss += profit; // negative value
+      }
+    });
+  });
+  return Object.values(map);
+};
+
 // ─── Theme ────────────────────────────────────────────────────────────────────
 // ─── Premium M3-Inspired Theme Tokens ────────────────────────────────────────
 const DARK = {
@@ -9794,7 +9832,7 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
   const extraAmt  = Math.max(parseFloat(extraCharge) || 0, 0);
   const total     = subtotal - discAmt + extraAmt;
   const paidAmt = payType === "partial" ? (parseFloat(partialAmt) || 0) : (payType === "cash" ? total : 0);
-  const bakiAmt = total - paidAmt;
+  const bakiAmt = Math.max(0, total - paidAmt);
   // Overpayment split: পরিশোধ > আজকের invoice → অতিরিক্ত অংশ কাস্টমারের জমা হবে
   const prevBalance = (!selCust || selCust.id === "__walkin__" || selCust.id === "__selfuse__") ? 0 : (selCust.balance || 0);
   const isOverpay = payType === "partial" && paidAmt > total && prevBalance > 0;
@@ -13080,33 +13118,72 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
       // রেঞ্জ অনুযায়ী ইনভয়েস ফিল্টার
       const allInvSrc  = dashModal.allInvs || dashModal.invs || [];
       const rangedInvs = allInvSrc.filter(i => dmRange.inRange(i.dateKey));
-      const allProdRows2 = calcProfitByProduct(rangedInvs, prodMap2, products)
-        .sort((a, b) => b.profit - a.profit);
-      const profitRows2  = allProdRows2.filter(r => r.profit > 0);
-      const lossRows2    = allProdRows2.filter(r => r.profit <= 0).sort((a,b) => a.profit - b.profit);
-      const totalProfit2 = profitRows2.reduce((s,r) => s + r.profit, 0);
-      const totalLoss2   = lossRows2.reduce((s,r) => s + r.profit, 0);
+
+      // নতুন invoice-level breakdown
+      const allProductRows = calcProfitByProductWithInvoices(rangedInvs, prodMap2, products);
+      const profitProducts = allProductRows.filter(r => r.totalProfit > 0 || r.profitInvs.length > 0);
+      const lossProducts   = allProductRows.filter(r => r.totalLoss < 0 || r.lossInvs.length > 0);
+
+      const totalProfit2 = profitProducts.reduce((s, r) => s + r.totalProfit, 0);
+      const totalLoss2   = lossProducts.reduce((s, r) => s + r.totalLoss, 0);
       const netResult    = totalProfit2 + totalLoss2;
+
       // WhatsApp টেক্সট
       const waTextPL = `*${shopName}* — লাভ ও লস (${dmRange.label})\n🟢 লাভ: ৳${fmt(Number(totalProfit2.toFixed(2)))} | 🔴 লস: ৳${fmt(Math.abs(Number(totalLoss2.toFixed(2))))}\n\n` +
-        [...profitRows2.map(r=>`✅ ${r.name}: +৳${fmt(Number(r.profit.toFixed(2)))}`), ...lossRows2.map(r=>`❌ ${r.name}: -৳${fmt(Math.abs(Number(r.profit.toFixed(2))))}`)].join("\n");
+        [...profitProducts.map(r=>`✅ ${r.name}: +৳${fmt(Number(r.totalProfit.toFixed(2)))}`), ...lossProducts.map(r=>`❌ ${r.name}: -৳${fmt(Math.abs(Number(r.totalLoss.toFixed(2))))}`)].join("\n");
 
-      const ProfitLossRow = ({ row, i, type }) => (
-        <div key={row.name} style={{ background: T.card, borderRadius:10, padding:"8px 8px", border:`1px solid ${type==="profit"?"#8b5cf622":"#ef444422"}` }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:4, marginBottom:4 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:4, flex:1, minWidth:0 }}>
-              <div style={{ width:18, height:18, borderRadius:5, background: type==="profit" ? "linear-gradient(135deg,#7c3aed,#a855f7)" : "linear-gradient(135deg,#dc2626,#ef4444)", display:"flex", alignItems:"center", justifyContent:"center", color:"#fff", fontWeight:900, fontSize:9, flexShrink:0 }}>{i+1}</div>
-              <div style={{ color:T.text, fontWeight:800, fontSize:11, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{row.name}</div>
+      // Accordion state — কোন পণ্য expand করা আছে (profit section এবং loss section আলাদা key)
+      // key format: "profit__{productName}" বা "loss__{productName}"
+      const [expandedKeys, setExpandedKeys] = React.useState({});
+      const toggleExpand = (key) => setExpandedKeys(prev => ({ ...prev, [key]: !prev[key] }));
+
+      // একটি পণ্যের accordion row
+      const ProductAccordionRow = ({ prodRow, type }) => {
+        const invs      = type === "profit" ? prodRow.profitInvs : prodRow.lossInvs;
+        const total     = type === "profit" ? prodRow.totalProfit : prodRow.totalLoss;
+        const acKey     = `${type}__${prodRow.name}`;
+        const isOpen    = !!expandedKeys[acKey];
+        const accentClr = type === "profit" ? "#a855f7" : "#ef4444";
+        const bgGrad    = type === "profit" ? "linear-gradient(135deg,#1e0d38,#2d1a52)" : "linear-gradient(135deg,#2d0d0d,#3d1010)";
+        const borderClr = type === "profit" ? "#8b5cf633" : "#ef444433";
+        return (
+          <div style={{ background: T.card, borderRadius:10, border:`1px solid ${borderClr}`, overflow:"hidden", marginBottom:6 }}>
+            {/* পণ্যের সারি — ক্লিক করলে expand */}
+            <div onClick={() => toggleExpand(acKey)}
+              style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"9px 10px", cursor:"pointer", userSelect:"none" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6, flex:1, minWidth:0 }}>
+                <div style={{ color:accentClr, fontSize:13 }}>{type==="profit"?"✅":"❌"}</div>
+                <div style={{ color:T.text, fontWeight:800, fontSize:12, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{prodRow.name}</div>
+                <div style={{ color:"#64748b", fontSize:9, fontWeight:600, marginLeft:2 }}>({invs.length}টি ইনভয়েস)</div>
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:6, flexShrink:0 }}>
+                <div style={{ color:accentClr, fontWeight:900, fontSize:13 }}>{type==="profit"?"+":" -"}৳{fmt(Math.abs(Number(total.toFixed(2))))}</div>
+                <div style={{ color:"#64748b", fontSize:10 }}>{isOpen?"▲":"▼"}</div>
+              </div>
             </div>
-            <div style={{ color: type==="profit" ? "#a855f7" : "#ef4444", fontWeight:900, fontSize:13, flexShrink:0 }}>{type==="profit"?"+":" -"}৳{fmt(Math.abs(Number(row.profit.toFixed(2))))}</div>
+            {/* expand হলে invoice list */}
+            {isOpen && (
+              <div style={{ background: bgGrad, borderTop:`1px solid ${borderClr}`, padding:"8px 10px", display:"flex", flexDirection:"column", gap:5 }}>
+                {invs.map((entry, idx) => (
+                  <div key={idx} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:4, padding:"5px 0", borderBottom: idx < invs.length-1 ? `1px solid ${borderClr}` : "none" }}>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      {/* ইনভয়েস নম্বরে ক্লিক করলে invoice detail modal */}
+                      <button onClick={(e) => { e.stopPropagation(); setViewInv(entry.inv); }}
+                        style={{ background:"none", border:"none", padding:0, cursor:"pointer", color:type==="profit"?"#c4b5fd":"#fca5a5", fontWeight:800, fontSize:11, fontFamily:"inherit", textDecoration:"underline" }}>
+                        {entry.invNo}
+                      </button>
+                      <div style={{ color:"#64748b", fontSize:9, marginTop:1 }}>{entry.reason} · পরিমাণ: {entry.qty}</div>
+                    </div>
+                    <div style={{ color:accentClr, fontWeight:900, fontSize:12, flexShrink:0 }}>
+                      {entry.profit >= 0 ? "+" : "-"}৳{fmt(Math.abs(Number(entry.profit.toFixed(2))))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          <div style={{ display:"flex", flexDirection:"column", gap:1 }}>
-            <div style={{ color:T.sub, fontSize:9 }}>পরিমাণ: <span style={{ color:T.text, fontWeight:700 }}>{row.qty}</span></div>
-            <div style={{ color:T.sub, fontSize:9 }}>মোট ক্রয়: <span style={{ color:"#f59e0b", fontWeight:700 }}>৳{fmt(Math.round(row.cost))}</span></div>
-            <div style={{ color:T.sub, fontSize:9 }}>মোট বিক্রয়: <span style={{ color:"#22c55e", fontWeight:700 }}>৳{fmt(Math.round(row.revenue))}</span></div>
-          </div>
-        </div>
-      );
+        );
+      };
 
       return (
         <div style={S.page}>
@@ -13123,7 +13200,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
               <svg width="15" height="15" viewBox="0 0 24 24" fill="#fff"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413z"/></svg>
               WhatsApp
             </button>
-            <button onClick={() => { const html = buildPdfHtml(`<div class="section"><h2>লাভ ও লস — ${dmRange.label}</h2><table><thead><tr><th>#</th><th>পণ্য</th><th class="num">লাভ/লস</th></tr></thead><tbody>${allProdRows2.map((r,i)=>`<tr><td>${i+1}</td><td>${r.name}</td><td class="num" style="color:${r.profit>=0?"#22c55e":"#ef4444"}">${r.profit>=0?"+":"-"}৳${fmt(Math.abs(Number(r.profit.toFixed(2))))}</td></tr>`).join("")}</tbody></table></div>`, shopName, `লাভ ও লস — ${dmRange.label}`); printPdfHtml(html); }}
+            <button onClick={() => { const rows = [...profitProducts.map(r=>`<tr><td>${r.name}</td><td style="color:#22c55e">+৳${fmt(Number(r.totalProfit.toFixed(2)))}</td></tr>`), ...lossProducts.map(r=>`<tr><td>${r.name}</td><td style="color:#ef4444">-৳${fmt(Math.abs(Number(r.totalLoss.toFixed(2))))}</td></tr>`)].join(""); const html = buildPdfHtml(`<div class="section"><h2>লাভ ও লস — ${dmRange.label}</h2><table><thead><tr><th>পণ্য</th><th class="num">লাভ/লস</th></tr></thead><tbody>${rows}</tbody></table></div>`, shopName, `লাভ ও লস — ${dmRange.label}`); printPdfHtml(html); }}
               style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:6, background:"linear-gradient(135deg,#1e40af,#3b82f6)", color:"#fff", border:"none", borderRadius:12, padding:"11px 8px", fontWeight:800, fontSize:13, cursor:"pointer", fontFamily:"inherit", boxShadow:"0 4px 14px rgba(59,130,246,0.35)" }}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v8H6z"/></svg>
               Print
@@ -13149,43 +13226,37 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
             </div>
           </div>
 
-          {/* লাভ ও লস — পাশাপাশি দুই কলাম */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
-          {/* লাভের কলাম */}
-          <div>
-          {profitRows2.length > 0 && (
-            <div>
+          {/* লাভ সেকশন — accordion */}
+          {profitProducts.length > 0 && (
+            <div style={{ marginBottom:16 }}>
               <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8, padding:"8px 10px", background:"linear-gradient(135deg,#1e0d38,#2d1a52)", borderRadius:12, border:"1px solid #8b5cf622" }}>
                 <div style={{ width:3, height:14, borderRadius:100, background:"linear-gradient(180deg,#8b5cf6,#a855f7)" }} />
-                <span style={{ color:"#c4b5fd", fontWeight:900, fontSize:11, letterSpacing:0.5 }}>💜 লাভ ({profitRows2.length})</span>
+                <span style={{ color:"#c4b5fd", fontWeight:900, fontSize:11, letterSpacing:0.5 }}>💜 লাভ ({profitProducts.length}টি পণ্য)</span>
                 <span style={{ marginLeft:"auto", color:"#a855f7", fontWeight:900, fontSize:12 }}>৳{fmt(Number(totalProfit2.toFixed(2)))}</span>
               </div>
-              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-                {profitRows2.map((row, i) => <ProfitLossRow key={`${row.name}-${i}`} row={row} i={i} type="profit" />)}
-              </div>
+              {profitProducts.map((row, i) => (
+                <ProductAccordionRow key={`profit_${row.name}_${i}`} prodRow={row} type="profit" />
+              ))}
             </div>
           )}
-          {profitRows2.length === 0 && <div style={{ color:T.sub, fontSize:12, textAlign:"center", padding:"12px 0" }}>লাভ নেই</div>}
-          </div>
-          {/* লসের কলাম */}
-          <div>
-          {lossRows2.length > 0 && (
-            <div>
+          {profitProducts.length === 0 && <div style={{ color:T.sub, fontSize:12, textAlign:"center", padding:"12px 0" }}>লাভ নেই</div>}
+
+          {/* লস সেকশন — accordion */}
+          {lossProducts.length > 0 && (
+            <div style={{ marginBottom:16 }}>
               <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8, padding:"8px 10px", background:"linear-gradient(135deg,#2d0d0d,#4d1a1a)", borderRadius:12, border:"1px solid #ef444422" }}>
                 <div style={{ width:3, height:14, borderRadius:100, background:"linear-gradient(180deg,#ef4444,#dc2626)" }} />
-                <span style={{ color:"#fca5a5", fontWeight:900, fontSize:11, letterSpacing:0.5 }}>🔴 লস ({lossRows2.length})</span>
+                <span style={{ color:"#fca5a5", fontWeight:900, fontSize:11, letterSpacing:0.5 }}>🔴 লস ({lossProducts.length}টি পণ্য)</span>
                 <span style={{ marginLeft:"auto", color:"#ef4444", fontWeight:900, fontSize:12 }}>৳{fmt(Math.abs(Number(totalLoss2.toFixed(2))))}</span>
               </div>
-              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-                {lossRows2.map((row, i) => <ProfitLossRow key={`${row.name}-${i}`} row={row} i={i} type="loss" />)}
-              </div>
+              {lossProducts.map((row, i) => (
+                <ProductAccordionRow key={`loss_${row.name}_${i}`} prodRow={row} type="loss" />
+              ))}
             </div>
           )}
-          {lossRows2.length === 0 && <div style={{ color:T.sub, fontSize:12, textAlign:"center", padding:"12px 0" }}>লস নেই</div>}
-          </div>
-          </div>
+          {lossProducts.length === 0 && <div style={{ color:T.sub, fontSize:12, textAlign:"center", padding:"12px 0" }}>লস নেই</div>}
 
-          {allProdRows2.length === 0 && <div style={S.empty}>{dmRange.label} কোনো বিক্রয় নেই</div>}
+          {allProductRows.length === 0 && <div style={S.empty}>{dmRange.label} কোনো বিক্রয় নেই</div>}
         </div>
       );
     }
@@ -13755,9 +13826,14 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
               {/* লাভ/লস কার্ড — বাম লাভ, ডান লস, নিচে নেট */}
               {c.isProfit ? (() => {
                 const _prodMap = new Map(products.map(p => [p.id, p]));
-                const _rows = calcProfitByProduct(repData.invs || [], _prodMap, products);
-                const _totalProfit = _rows.filter(r => r.profit > 0).reduce((s,r) => s + r.profit, 0);
-                const _totalLoss   = _rows.filter(r => r.profit <= 0).reduce((s,r) => s + r.profit, 0);
+                const _totalProfit = (repData.invs || []).reduce((s, inv) => {
+                  const p = calcInvoiceProfit(inv, _prodMap);
+                  return s + (p > 0 ? p : 0);
+                }, 0);
+                const _totalLoss = (repData.invs || []).reduce((s, inv) => {
+                  const p = calcInvoiceProfit(inv, _prodMap);
+                  return s + (p < 0 ? p : 0);
+                }, 0);
                 const _net = _totalProfit + _totalLoss;
                 const lossAccent = DT.mono[5]; // লস সবসময় নিউট্রাল/সতর্কতামূলক ধূসর-লাল টোনে
                 const profitCol = DT.dark ? cAccent : "#fff";
@@ -13767,11 +13843,11 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
                   <div style={{ marginBottom:3 }}>
                     <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:4 }}>
                       <div>
-                        <div style={{ color: DT.dark ? "#86efac" : "rgba(255,255,255,0.75)", fontSize:8.5, fontWeight:700, marginBottom:1 }}>মোট লাভ</div>
+                        <div style={{ color: DT.dark ? "#86efac" : "rgba(255,255,255,0.75)", fontSize:8.5, fontWeight:700, marginBottom:1 }}>আজকের লাভ</div>
                         <div style={{ color:profitCol, fontWeight:900, fontSize:17, letterSpacing:-0.5, lineHeight:1, textShadow: DT.dark ? `0 0 20px ${cAccent}55` : "none" }}>৳{fmt(Number(_totalProfit.toFixed(2)))}</div>
                       </div>
                       <div style={{ textAlign:"right" }}>
-                        <div style={{ color: DT.dark ? "#fca5a5" : "rgba(255,255,255,0.75)", fontSize:8.5, fontWeight:700, marginBottom:1 }}>মোট লস</div>
+                        <div style={{ color: DT.dark ? "#fca5a5" : "rgba(255,255,255,0.75)", fontSize:8.5, fontWeight:700, marginBottom:1 }}>আজকের লস</div>
                         <div style={{ color:lossCol, fontWeight:900, fontSize:17, letterSpacing:-0.5, lineHeight:1, textShadow: (DT.dark && _totalLoss < 0) ? "0 0 20px #ef444455" : "none" }}>৳{fmt(Math.abs(Number(_totalLoss.toFixed(2))))}</div>
                       </div>
                     </div>
@@ -16313,11 +16389,16 @@ function DailyNotifCard({ S, T = {}, shopName, showToast, customers = [], invoic
     const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && !_voidedIds2.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
     const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal").reduce((s, t) => s + t.amount, 0);
     const totalBakiNow  = (customers || []).reduce((s, c) => s + (c.balance || 0), 0);
-    // 🟢 আজকের লাভ ও 🔴 আজকের লস — পণ্য ভিত্তিক হিসাব, দুটোই একসাথে অ-শূন্য হতে পারে
+    // 🟢 আজকের লাভ ও 🔴 আজকের লস — invoice-level আলাদা করে হিসাব (একই পণ্যের ভিন্ন ইনভয়েস cancel হবে না)
     const prodMap   = new Map((products || []).map(p => [p.id, p]));
-    const prodRows  = calcProfitByProduct(todayInvList, prodMap, products);
-    const totalProfit = prodRows.filter(r => r.profit > 0).reduce((s, r) => s + r.profit, 0);
-    const totalLoss   = Math.abs(prodRows.filter(r => r.profit <= 0).reduce((s, r) => s + r.profit, 0));
+    const totalProfit = todayInvList.reduce((s, inv) => {
+      const p = calcInvoiceProfit(inv, prodMap);
+      return s + (p > 0 ? p : 0);
+    }, 0);
+    const totalLoss = todayInvList.reduce((s, inv) => {
+      const p = calcInvoiceProfit(inv, prodMap);
+      return s + (p < 0 ? Math.abs(p) : 0);
+    }, 0);
     // 💰 ক্যাশ ড্রয়ার — ওপেনিং ক্যাশ ও আজ দোকান থেকে বের হওয়া টাকা (ক্যাশড্রয়ার কার্ড থেকে)
     const cashLogsAll  = cashLogs || [];
     const openingCash  = cashLogsAll.filter(c => c.type === "opening" && c.dateKey === todayKey).reduce((s, c) => s + (c.amount || 0), 0);
