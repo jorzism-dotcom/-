@@ -3357,6 +3357,7 @@ const SK = {
   shopName: "sbm-shopname", darkMode: "sbm-darkmode", activeTheme: "sbm-active-theme", fontSize: "sbm-font-size", deletedCustomers: "sbm-deleted-customers", deletedProducts: "sbm-deleted-products",
   paymentInvoices: "sbm-payment-invoices", smsGateway: "sbm-sms-gateway",
   lastAutoBackup: "sbm-last-auto-backup", anthropicKey: "sbm-anthropic-key",
+  lastLocalBackup: "sbm-last-local-backup",
   smsTemplates: "sbm-sms-templates",
   autoBackupEnabled: "sbm-auto-backup-on",
   backupSnapshot: "sbm-backup-snapshot",
@@ -8397,7 +8398,7 @@ function SmartBusinessMgmt() {
               recoveryPinHash={recoveryPinHash} setRecoveryPinHash={setRecoveryPinHashState}
               cashLogs={cashLogs} setCashLogs={setCashLogs}
               suppliers={suppliers} setSuppliers={setSuppliers}
-              hasPerm={hasPerm}
+              hasPerm={hasPerm} fssReady={fssReady}
             />
             </React.Suspense>
           </ErrorBoundary>
@@ -16702,7 +16703,7 @@ function StaffCustomTimePicker({ T, staffName, onGrant }) {
 }
 
 function Settings_({ T, S, shopName,
- setShopName, users, setUsers, currentUser, setCurrentUser, showToast, customers, setCustomers, products, setProducts, invoices, setInvoices, txns, setTxns, smsLog, setSmsLog, sendSMS, darkMode, setDarkMode, activeTheme, setActiveTheme, fontSize, setFontSize, deletedCustomers, setDeletedCustomers, deletedProducts = [], setDeletedProducts, smsGateway, setSmsGateway, btConnected, btDevice, onConnectBluetooth, onDisconnectBluetooth, paymentInvoices, setPaymentInvoices, purchaseOrders = [], setPurchaseOrders, stockMovements = [], setStockMovements, lastAutoBackup, driveStatus, backupNeeded, performDriveBackup, buildBackupData, setBackupNeeded, anthropicKey, setAnthropicKey, smsTemplates, setSmsTemplates, autoBackupEnabled, setAutoBackupEnabled, firebaseConfig, setFirebaseConfig, firebaseEnabled, setFirebaseEnabled, setAuthSession, devContact, setDevContact, masterResetHash, setMasterResetHash, activeDevices = [], setActiveDevices, recoveryPhone, setRecoveryPhone, recoveryPinHash, setRecoveryPinHash, cashLogs = [], setCashLogs, suppliers = [], setSuppliers, hasPerm }) {
+ setShopName, users, setUsers, currentUser, setCurrentUser, showToast, customers, setCustomers, products, setProducts, invoices, setInvoices, txns, setTxns, smsLog, setSmsLog, sendSMS, darkMode, setDarkMode, activeTheme, setActiveTheme, fontSize, setFontSize, deletedCustomers, setDeletedCustomers, deletedProducts = [], setDeletedProducts, smsGateway, setSmsGateway, btConnected, btDevice, onConnectBluetooth, onDisconnectBluetooth, paymentInvoices, setPaymentInvoices, purchaseOrders = [], setPurchaseOrders, stockMovements = [], setStockMovements, lastAutoBackup, driveStatus, backupNeeded, performDriveBackup, buildBackupData, setBackupNeeded, anthropicKey, setAnthropicKey, smsTemplates, setSmsTemplates, autoBackupEnabled, setAutoBackupEnabled, firebaseConfig, setFirebaseConfig, firebaseEnabled, setFirebaseEnabled, setAuthSession, devContact, setDevContact, masterResetHash, setMasterResetHash, activeDevices = [], setActiveDevices, recoveryPhone, setRecoveryPhone, recoveryPinHash, setRecoveryPinHash, cashLogs = [], setCashLogs, suppliers = [], setSuppliers, hasPerm, fssReady = false }) {
   const [editName,    setEditName]    = useState(false);
   const [nameInput,   setNameInput]   = useState(shopName);
   const [showNewUser, setShowNewUser] = useState(false);
@@ -16869,8 +16870,8 @@ function Settings_({ T, S, shopName,
         if (data.txns)            setTxns(data.txns);
         if (data.smsLog)          setSmsLog(data.smsLog);
         if (data.paymentInvoices) setPaymentInvoices(data.paymentInvoices);
-        if (data.purchaseOrders)  setters.setPurchaseOrders(data.purchaseOrders);
-        if (data.stockMovements)  setters.setStockMovements(data.stockMovements);
+        if (data.purchaseOrders)  setPurchaseOrders(data.purchaseOrders);
+        if (data.stockMovements)  setStockMovements(data.stockMovements);
         showToast("ডেটা ইম্পোর্ট সফল হয়েছে");
       } catch { showToast("ফাইল পড়তে সমস্যা হয়েছে", "#ef4444"); }
     };
