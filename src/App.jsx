@@ -20110,6 +20110,9 @@ const GDrive = {
           if (hashIdx !== -1) paramStr = deepLink.slice(hashIdx + 1);
           else if (qIdx !== -1) paramStr = deepLink.slice(qIdx + 1);
           const params = new URLSearchParams(paramStr);
+          // oauth.html থেকে error deep link এলে (interaction_required ইত্যাদি) — reject করো
+          const oauthError = params.get("error");
+          if (oauthError) { reject(new Error(oauthError)); return; }
           const token = params.get("access_token");
           if (!token) { reject(new Error("Token পাওয়া যায়নি")); return; }
           GDrive.saveToken(token);
