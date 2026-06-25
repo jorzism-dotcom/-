@@ -6187,7 +6187,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
                 { icon: "🏠", val: `৳${fmt(monthSelfUseCost)}`, label: "নিজের ব্যবহার (এই মাস)", sub: "মালিকের ড্রয়িং — খরচমূল্যে, লাভ/লসে ধরা হয়নি", color: "#a78bfa" },
               ] : []),
             ].map((item, i) => (
-              <div key={i} style={{
+              <div key={item.label || i} style={{
                 background: T.card, borderRadius: 14, padding: "14px 12px",
                 border: `1px solid ${item.color}33`,
                 boxShadow: `0 2px 14px ${item.color}18`,
@@ -6284,7 +6284,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
                 📦 এখনই রিঅর্ডার করুন ({forecastData.filter(p => p.needReorder).length}টি)
               </div>
               {forecastData.filter(p => p.needReorder).slice(0, 5).map((p, i) => (
-                <div key={i} style={{
+                <div key={p.id || p.name || i} style={{
                   display: "flex", justifyContent: "space-between",
                   padding: "6px 0",
                   borderBottom: i < 4 ? `1px solid ${T.border}` : "none",
@@ -6312,7 +6312,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
               padding: "10px 12px", borderBottom: `1px solid ${T.border}`,
             }}>
               {["পণ্যের নাম", "এই মাস", "আগের মাস", "পূর্বাভাস", "স্টক আছে"].map((h, i) => (
-                <div key={i} style={{ color: "#6366f1", fontWeight: 900, fontSize: 11, textAlign: i > 0 ? "center" : "left" }}>{h}</div>
+                <div key={h || i} style={{ color: "#6366f1", fontWeight: 900, fontSize: 11, textAlign: i > 0 ? "center" : "left" }}>{h}</div>
               ))}
             </div>
             {forecastData.length === 0 ? (
@@ -6320,7 +6320,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
                 📊 পর্যাপ্ত বিক্রয় ডেটা নেই
               </div>
             ) : forecastData.slice(0, 25).map((p, i) => (
-              <div key={i} style={{
+              <div key={p.id || p.name || i} style={{
                 display: "grid", gridTemplateColumns: "1fr 56px 64px 72px 68px",
                 padding: "10px 12px",
                 borderBottom: i < forecastData.length - 1 ? `1px solid ${T.border}` : "none",
@@ -6385,7 +6385,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
             <div style={{ background: T.card, borderRadius: 14, padding: "12px 14px", border: "1px solid #22c55e33" }}>
               <div style={{ color: "#22c55e", fontWeight: 800, fontSize: 13, marginBottom: 8 }}>🌟 বেশি লাভের পণ্য (এগুলো বেশি বিক্রি করুন)</div>
               {profitAnalysis.heroes.map((p, i) => (
-                <div key={i} style={{
+                <div key={p.id || p.name || i} style={{
                   display: "flex", justifyContent: "space-between", alignItems: "center",
                   padding: "8px 0",
                   borderBottom: i < profitAnalysis.heroes.length - 1 ? `1px solid ${T.border}` : "none",
@@ -6411,7 +6411,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
             <div style={{ background: T.card, borderRadius: 14, padding: "12px 14px", border: "1px solid #ef444433" }}>
               <div style={{ color: "#ef4444", fontWeight: 800, fontSize: 13, marginBottom: 8 }}>⚠️ কম লাভের পণ্য (দাম বাড়ান অথবা বিক্রি বন্ধ করুন)</div>
               {profitAnalysis.villains.map((p, i) => (
-                <div key={i} style={{
+                <div key={p.id || p.name || i} style={{
                   display: "flex", justifyContent: "space-between", alignItems: "center",
                   padding: "8px 0",
                   borderBottom: i < profitAnalysis.villains.length - 1 ? `1px solid ${T.border}` : "none",
@@ -6440,7 +6440,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
                 🏷️ ডিসকাউন্ট সাজেশন (স্টক আটকে আছে)
               </div>
               {overstockItems.slice(0, 6).map((p, i) => (
-                <div key={i} style={{
+                <div key={p.id || p.name || i} style={{
                   padding: "10px 0",
                   borderBottom: i < Math.min(overstockItems.length, 6) - 1 ? `1px solid ${T.border}` : "none",
                 }}>
@@ -6592,7 +6592,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
               <div style={{ color: T.sub, fontSize: 12, marginTop: 4 }}>এখন কোনো জরুরি কাজ নেই। ব্যবসা ভালোভাবেই চলছে।</div>
             </div>
           ) : smartActions.map((action, i) => (
-            <div key={i} style={{
+            <div key={action.label || i} style={{
               background: T.card, borderRadius: 14, padding: "14px 16px",
               border: `1.5px solid ${action.color}44`,
               boxShadow: action.priority === "high" ? `0 4px 20px ${action.color}22` : "none",
@@ -6639,7 +6639,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
             ].map((item, i) => {
               const p = Math.min(100, item.target > 0 ? Math.round((item.current / item.target) * 100) : 0);
               return (
-                <div key={i} style={{ marginBottom: i === 0 ? 12 : 0 }}>
+                <div key={item.label || i} style={{ marginBottom: i === 0 ? 12 : 0 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
                     <div style={{ color: T.text, fontWeight: 800, fontSize: 12 }}>{item.label}</div>
                     <div style={{ color: T.sub, fontSize: 12 }}>৳{fmt(item.current)} / ৳{fmt(Math.round(item.target))}</div>
@@ -6705,7 +6705,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
                 </div>
               </div>
             ) : chatMessages.map((msg, i) => (
-              <div key={i} style={{
+              <div key={`msg-${i}-${msg.role}`} style={{
                 alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
                 maxWidth: "85%",
                 background: msg.role === "user"
@@ -6851,7 +6851,7 @@ function HealthMeter({ score, label, T, activeColor, growthPct }) {
             { label: "মার্জিন", pct: Math.min(100, Math.max(0, score > 50 ? 70 : 30)), color: "#22c55e" },
             { label: "বকেয়া ঝুঁকি", pct: Math.min(100, Math.max(0, 100 - score)), color: "#ef4444" },
           ].map((bar, i) => (
-            <div key={i}>
+            <div key={bar.label || i}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                 <span style={{ color: "#94a3b8", fontSize: 10 }}>{bar.label}</span>
               </div>
@@ -6893,7 +6893,7 @@ function WeeklySalesBar({ invoices, T, color }) {
       <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>সাপ্তাহিক বিক্রয় ট্রেন্ড</div>
       <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 50 }}>
         {days.map((d, i) => (
-          <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+          <div key={d.key || i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
             <div style={{
               width: "100%", borderRadius: "4px 4px 0 0",
               height: `${Math.max(4, (d.sale / max) * 40)}px`,
@@ -13534,7 +13534,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
           {dashModal.rows.length === 0 && <div style={S.empty}>কোনো তথ্য নেই</div>}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {dashModal.rows.map((row, i) => (
-              <div key={i} className="qc-gradient-card" style={{ ...S.card, marginBottom: 0, padding: "12px 14px" }}>
+              <div key={row.id || row.name + (row.mobile || "") || i} className="qc-gradient-card" style={{ ...S.card, marginBottom: 0, padding: "12px 14px" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
                   <div style={{ ...S.avatar, width: 34, height: 34, fontSize: 13 }}>{row.name[0]}</div>
                   <div>
@@ -14047,7 +14047,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
           {filteredItems.length === 0 && <div style={S.empty}>এই সময়ে কোনো জমার রশিদ নেই</div>}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {filteredItems.map((pinv, i) => (
-              <div key={i} className="qc-gradient-card" style={{ ...S.card, marginBottom: 0, padding: "12px 14px" }}>
+              <div key={pinv.id || i} className="qc-gradient-card" style={{ ...S.card, marginBottom: 0, padding: "12px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <div style={{ ...S.avatar, width: 34, height: 34, fontSize: 13, background: "linear-gradient(135deg,#0369a1,#0ea5e9)" }}>{pinv.customerName[0]}</div>
@@ -15454,7 +15454,7 @@ function InvoiceReceiptPrint({ inv, customer, type }) {
         <thead><tr><th>#</th><th>পণ্য</th><th className="right">পরিমাণ</th><th className="right">দাম</th><th className="right">মোট</th></tr></thead>
         <tbody>
           {inv.items.map((item, i) => (
-            <tr key={i}><td style={{ color: "#666", fontSize: 10 }}>{i+1}</td><td>{item.name}</td><td className="right">{item.qty}</td><td className="right">৳{item.price}</td><td className="right">৳{item.qty * item.price}</td></tr>
+            <tr key={item.productId ? item.productId + "_" + i : i}><td style={{ color: "#666", fontSize: 10 }}>{i+1}</td><td>{item.name}</td><td className="right">{item.qty}</td><td className="right">৳{item.price}</td><td className="right">৳{item.qty * item.price}</td></tr>
           ))}
         </tbody>
       </table>
