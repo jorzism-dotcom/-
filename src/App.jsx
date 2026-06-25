@@ -6579,7 +6579,7 @@ function AIPage_({ T, S, customers, invoices, products, txns, paymentInvoices, s
             </div>
             {[
               { label: "বিক্রয় লক্ষ্য", current: weekSale, target: dailyAvg * 7, color: "#22c55e" },
-              { label: "বাকি আদায়", current: txnAll.filter(t => t.type === "joma" && (t.dateKey >= d7 || t.date >= d7)).reduce((s, t) => s + t.amount, 0), target: totalBaki * 0.15, color: "#3b82f6" },
+              { label: "বাকি আদায়", current: txnAll.filter(t => t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "cash-sale" && (t.dateKey >= d7 || t.date >= d7)).reduce((s, t) => s + t.amount, 0), target: totalBaki * 0.15, color: "#3b82f6" },
             ].map((item, i) => {
               const p = Math.min(100, item.target > 0 ? Math.round((item.current / item.target) * 100) : 0);
               return (
@@ -7660,7 +7660,7 @@ function SmartBusinessMgmt() {
         }, 0);
         const _voidedIds1   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
         const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && t.invoiceId && !_voidedIds1.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
-        const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "overpay").reduce((s, t) => s + t.amount, 0);
+        const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "cash-sale").reduce((s, t) => s + t.amount, 0);
         const totalBakiNow  = (customers || []).reduce((s, c) => s + (c.balance || 0), 0);
         // invoice-level আলাদা করে লাভ/লস — buildSummary()-এর সাথে মিল থাকবে
         const _prodMap    = new Map((products || []).map(p => [p.id, p]));
@@ -8085,7 +8085,7 @@ function SmartBusinessMgmt() {
     const txnBaki = txns.filter(t => t.dateKey === key && t.type === "baki" && t.invoiceId && !voidedInvIds.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
     return txnBaki;
   }, [txns, invoices]);
-  const todayJoma  = useMemo(() => { const key = todayEn(); return txns.filter(t => t.dateKey === key && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "overpay").reduce((s, t) => s + t.amount, 0); }, [txns]);
+  const todayJoma  = useMemo(() => { const key = todayEn(); return txns.filter(t => t.dateKey === key && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "cash-sale").reduce((s, t) => s + t.amount, 0); }, [txns]);
   const todayInvs  = useMemo(() => { const key = todayEn(); return invoices.filter(i => i.dateKey === key && !i.isSelfUse && i.status !== "voided"); }, [invoices]);
   const todayTotal = useMemo(() => todayInvs.reduce((s, i) => s + (i.total || 0), 0), [todayInvs]);
   const totalBaki  = useMemo(() => customers.reduce((s, c) => s + (c.balance || 0), 0), [customers]);
@@ -10251,6 +10251,12 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
       showToast("ইনভয়েস তৈরি ও SMS পাঠানো হয়েছে");
     } else {
       await Haptic.success();
+      // পূর্ণ নগদ বিক্রয় (registered কাস্টমার, walk-in/self-use নয়) — txn রেকর্ড করো যাতে
+      // কাস্টমার ডিটেইলস পেজে এই ইনভয়েসটি লেনদেন হিস্টোরিতে দেখা যায়।
+      // source: "cash-sale" — পুরনো বাকি আদায় নয়, তাই সব "আজকের বাকি আদায়" sum থেকে বাদ থাকবে (partial-sale এর মতো)
+      if (!isWalkIn && !isSelfUse && effectivePayType === "cash" && selCust) {
+        addTxn(selCust.id, "joma", total, selCust.balance || 0, inv.id, `নগদ বিক্রয় — ইনভয়েস #${inv.id.slice(-6).toUpperCase()}`, null, "cash-sale");
+      }
       if (walkInHasBaki && walkInBakiAmt > 0) {
         showToast(`Walk-in ইনভয়েস — বাকি ৳${fmt(walkInBakiAmt)} সেভ হয়েছে`);
       } else {
@@ -14146,7 +14152,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
               idx:2,
               sub:`${bakiCustomers.length}জন কাস্টমারের বাকি`,
               iconPath: <><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M2 10h20"/><path d="M7 15h2"/><path d="M12 15h5"/></>,
-              modal: { title:"বাকি আছে এমন কাস্টমার", type:"customer-breakdown", rows: bakiCustomers.map(c => { const cTxns = txns.filter(t => t.customerId === c.id); return { name:c.name, mobile:c.mobile, balance:c.balance, baki:cTxns.filter(t=>t.type==="baki").reduce((s,t)=>s+t.amount,0), joma:cTxns.filter(t=>t.type==="joma").reduce((s,t)=>s+t.amount,0) }; }).sort((a,b)=>b.balance-a.balance) },
+              modal: { title:"বাকি আছে এমন কাস্টমার", type:"customer-breakdown", rows: bakiCustomers.map(c => { const cTxns = txns.filter(t => t.customerId === c.id); return { name:c.name, mobile:c.mobile, balance:c.balance, baki:cTxns.filter(t=>t.type==="baki").reduce((s,t)=>s+t.amount,0), joma:cTxns.filter(t=>t.type==="joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "cash-sale").reduce((s,t)=>s+t.amount,0) }; }).sort((a,b)=>b.balance-a.balance) },
             },
             {
               label:"আজকের বাকি আদায়", value:`৳${fmt(todayJoma)}`,
@@ -14633,8 +14639,11 @@ function CustomerDetail({ T, S, customer, txns, invoices, customers, paymentInvo
           const inv = t.invoiceId ? invoices.find(iv => iv.id === t.invoiceId) : null;
           const payInv = t.paymentInvoiceId ? paymentInvoices.find(p => p.id === t.paymentInvoiceId) : null;
           const isBaki = t.type === "baki";
+          // নগদ বিক্রয়ের txn-এ কোনো আলাদা void-reversal এন্ট্রি তৈরি হয় না (balance অপরিবর্তিত থাকে বলে) —
+          // তাই ইনভয়েস ভয়েড হলে এখানেই badge দেখিয়ে স্পষ্ট করা হচ্ছে যে এই বিক্রয়টি বাতিল হয়ে গেছে।
+          const isVoidedCashSale = t.source === "cash-sale" && inv && inv.status === "voided";
           return (
-            <div key={t.id} style={S.txnCard}>
+            <div key={t.id} style={{ ...S.txnCard, opacity: isVoidedCashSale ? 0.55 : 1 }}>
               <div style={{ width: 5, flexShrink: 0, background: isBaki ? "#ef4444" : "#22c55e" }} />
               <div style={{ flex: 1, padding: "12px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
@@ -14642,9 +14651,14 @@ function CustomerDetail({ T, S, customer, txns, invoices, customers, paymentInvo
                     <span style={{ ...S.txnBadge, background: isBaki ? "#ef444422" : "#22c55e22", color: isBaki ? "#ef4444" : "#22c55e" }}>
                       {isBaki ? "▲ বাকি" : "▼ জমা"}
                     </span>
-                    <span style={{ color: isBaki ? "#ef4444" : "#22c55e", fontWeight: 800, fontSize: 17 }}>
+                    <span style={{ color: isBaki ? "#ef4444" : "#22c55e", fontWeight: 800, fontSize: 17, textDecoration: isVoidedCashSale ? "line-through" : "none" }}>
                       {isBaki ? "+" : "−"}৳{fmt(t.amount)}
                     </span>
+                    {isVoidedCashSale && (
+                      <span style={{ background: "#6b728022", color: "#9ca3af", border: "1px solid #6b728044", borderRadius: 6, padding: "2px 7px", fontSize: 10, fontWeight: 800 }}>
+                        ✕ ভয়েড
+                      </span>
+                    )}
                   </div>
                   <span style={{ color: T.sub, fontSize: 11 }}>{t.time}</span>
                 </div>
@@ -16651,7 +16665,7 @@ function DailyNotifCard({ S, T = {}, shopName, showToast, customers = [], invoic
     }, 0);
     const _voidedIds2   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
     const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && t.invoiceId && !_voidedIds2.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
-    const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "overpay").reduce((s, t) => s + t.amount, 0);
+    const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal" && t.source !== "cash-sale").reduce((s, t) => s + t.amount, 0);
     const totalBakiNow  = (customers || []).reduce((s, c) => s + (c.balance || 0), 0);
     // 🟢 আজকের লাভ ও 🔴 আজকের লস — invoice-level আলাদা করে হিসাব (একই পণ্যের ভিন্ন ইনভয়েস cancel হবে না)
     const prodMap   = new Map((products || []).map(p => [p.id, p]));
