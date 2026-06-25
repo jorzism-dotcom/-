@@ -444,15 +444,17 @@ function installGlobalAutoCapitalize() {
     } catch (_) {}
   }
 
-  document.addEventListener("input", (e) => {
-    const el = e.target;
-    if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return;
+  function eligible(el) {
+    if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return false;
     if (el.tagName === "INPUT") {
       const t = (el.type || "text").toLowerCase();
       // শুধু free-text টাইপের বক্সে কাজ করবে — number/password/date/email-pattern-sensitive বক্স বাদ
-      if (!["text", "search", "tel", "url"].includes(t)) return;
+      if (!["text", "search", "tel", "url"].includes(t)) return false;
     }
-    if (e.isComposing) return; // বাংলা IME composition চলাকালীন স্কিপ — অভ্র/রিদ্মিক ভাঙবে না
+    return true;
+  }
+
+  function applyCapitalize(el) {
     const val = el.value;
     if (!val) return;
     const first = val[0];
@@ -468,6 +470,30 @@ function installGlobalAutoCapitalize() {
     // fiber walk করে সরাসরি onChange কল করাটা অনির্ভরযোগ্য কারণ React
     // internal synthetic event object আশা করে যা আমরা বানাতে পারি না।
     el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  document.addEventListener("input", (e) => {
+    const el = e.target;
+    if (!eligible(el)) return;
+    if (e.isComposing) return; // composing চলাকালীন স্কিপ — অভ্র/রিদ্মিক/Gboard predictive ভাঙবে না
+    applyCapitalize(el);
+  }, true);
+
+  // Gboard/SwiftKey-এ ইংরেজি শব্দ টাইপের সময়ও autocorrect-এর জন্য composition span
+  // চালু থাকে (isComposing=true থাকে পুরো শব্দ ধরে) — তাই উপরের "input" শোনা যথেষ্ট নয়,
+  // composition শেষ হলে (word commit / স্পেস / blur) আবার চেক করতে হয়।
+  document.addEventListener("compositionend", (e) => {
+    const el = e.target;
+    if (!eligible(el)) return;
+    applyCapitalize(el);
+  }, true);
+
+  // Fallback: ব্লার হওয়ার সময়ও একবার চেক — কোনো কীবোর্ডে compositionend ঠিকমতো না ফায়ার করলেও
+  // শেষ মুহূর্তে প্রথম অক্ষর capital করে দেয়।
+  document.addEventListener("blur", (e) => {
+    const el = e.target;
+    if (!eligible(el)) return;
+    applyCapitalize(el);
   }, true);
 }
 
@@ -7626,7 +7652,7 @@ function SmartBusinessMgmt() {
           return s;
         }, 0);
         const _voidedIds1   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
-        const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && !_voidedIds1.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
+        const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && t.invoiceId && !_voidedIds1.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
         const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal").reduce((s, t) => s + t.amount, 0);
         const totalBakiNow  = (customers || []).reduce((s, c) => s + (c.balance || 0), 0);
         // invoice-level আলাদা করে লাভ/লস — buildSummary()-এর সাথে মিল থাকবে
@@ -8047,7 +8073,9 @@ function SmartBusinessMgmt() {
     const key = todayEn(); // capture fresh at evaluation time
     // ইনভয়েস বাতিল হলে তার "বাকি" txn আজকের বাকি থেকে বাদ যাবে
     const voidedInvIds = new Set(invoices.filter(i => i.status === "voided").map(i => i.id));
-    const txnBaki = txns.filter(t => t.dateKey === key && t.type === "baki" && !voidedInvIds.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
+    // কাস্টমার-ডিটেইলস পেজ থেকে করা ম্যানুয়াল বাকি এন্ট্রি (invoiceId নেই) ইচ্ছাকৃতভাবে বাদ —
+    // ওটা শুধু মোট বাকিতে (customer.balance) থাকবে, আজকের বাকিতে আসবে না।
+    const txnBaki = txns.filter(t => t.dateKey === key && t.type === "baki" && t.invoiceId && !voidedInvIds.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
     return txnBaki;
   }, [txns, invoices]);
   const todayJoma  = useMemo(() => { const key = todayEn(); return txns.filter(t => t.dateKey === key && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal").reduce((s, t) => s + t.amount, 0); }, [txns]);
@@ -9995,8 +10023,8 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
   const bakiAmt = Math.max(0, total - paidAmt);
   // Overpayment split: পরিশোধ > আজকের invoice → অতিরিক্ত অংশ কাস্টমারের জমা হবে
   const prevBalance = (!selCust || selCust.id === "__walkin__" || selCust.id === "__selfuse__") ? 0 : (selCust.balance || 0);
-  const isOverpay = payType === "partial" && paidAmt > total && prevBalance > 0;
-  const overpayAmt = isOverpay ? Math.min(paidAmt - total, prevBalance) : 0;
+  const isOverpay = payType === "partial" && paidAmt > total;
+  const overpayAmt = isOverpay ? (paidAmt - total) : 0;
   const newBalance = prevBalance + bakiAmt - overpayAmt;
 
   const resetAll = () => {
@@ -10179,8 +10207,8 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
     if (!isWalkIn && !isSelfUse && (effectivePayType === "baki" || effectivePayType === "partial")) {
       // Overpayment: paid > total → অতিরিক্ত অংশ কাস্টমারের আগের বাকি থেকে বাদ যাবে (জমা)
       const _prevBal = selCust.balance || 0;
-      const _isOverpay = effectivePayType === "partial" && paidAmt > total && _prevBal > 0;
-      const _overpayAmt = _isOverpay ? Math.min(paidAmt - total, _prevBal) : 0;
+      const _isOverpay = effectivePayType === "partial" && paidAmt > total;
+      const _overpayAmt = _isOverpay ? (paidAmt - total) : 0;
       inv.overpayAmount = _overpayAmt; // রিসিট/হিস্টোরিতে "বর্তমান বাকি" ঠিকভাবে দেখানোর জন্য সংরক্ষণ
       const newBal = _prevBal + bakiAmt - _overpayAmt;
       setCustomers(prev => prev.map(c => c.id === selCust.id ? { ...c, balance: Math.max(0, newBal) } : c));
@@ -10426,7 +10454,7 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
               display: "flex", alignItems: "center", gap: 6,
               opacity: (selCust && selCust.id !== "__walkin__") ? 1 : 0,
               transition: "opacity 0.3s ease",
-              pointerEvents: "none",
+              pointerEvents: (selCust && selCust.id !== "__walkin__") ? "auto" : "none",
             }}>
               <div style={{
                 background: "#22c55e22", border: "1px solid #22c55e55",
@@ -10450,6 +10478,15 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
               title={selCust && selCust.id !== "__walkin__" ? selCust.name : ""}>
                 {selCust && selCust.id !== "__walkin__" ? selCust.name : ""}
               </div>
+              <button
+                onClick={() => { setSelCust(null); setCustSearch(""); }}
+                style={{
+                  width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
+                  background: "#ef444422", border: "1px solid #ef444466",
+                  color: "#ef4444", fontWeight: 900, fontSize: 12,
+                  cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+                title="কাস্টমার আনসিলেক্ট করুন">✕</button>
             </div>
           </div>
 
@@ -10510,7 +10547,7 @@ function SmartInvoiceBuilder({ T, S, customers, products, setCustomers, setInvoi
           }}>
             {filteredCustomers.map((c, idx) => (
               <div key={c.id}
-                onClick={() => { setSelCust(c); setCustSearch(""); }}
+                onClick={() => { setSelCust(prev => (prev?.id === c.id ? null : c)); setCustSearch(""); }}
                 style={{
                   display: "flex", alignItems: "center", gap: 12,
                   padding: "12px 14px", borderRadius: 14, cursor: "pointer",
@@ -13814,6 +13851,9 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
     const relTxn = txns.find(t => t.invoiceId === inv.id && t.dateKey === todayEn() && t.type === "baki");
     return !!relTxn;
   });
+  // কাস্টমার-ডিটেইলস পেজ থেকে করা ম্যানুয়াল বাকি/জমা এন্ট্রি (invoiceId: null) ইচ্ছাকৃতভাবেই
+  // "আজকের বাকি" থেকে বাদ — শুধু মোট বাকিতে (customer.balance এর মাধ্যমে) থাকবে।
+  const todayBakiInvsFull = todayBakiInvs;
 
   // ── 📅 "আজকের রিপোর্ট"-এর জন্য নির্বাচিত তারিখ/রেঞ্জের হিসাব ─────────────────
   const REPORT_RANGES = [
@@ -13853,7 +13893,7 @@ function Dashboard({ T, S, customers, totalBaki, todayBaki, todayJoma, todayTota
   const repData = isToday
     ? {
         invs: todayInvs, total: todayTotal, cashSale: todayCashSale, baki: todayBaki,
-        profit: todayProfit, bakiInvs: todayBakiInvs,
+        profit: todayProfit, bakiInvs: todayBakiInvsFull,
         selfUseInvs: todaySelfUseInvs, selfUseCost: todaySelfUseCost,
         voidedInvs: todayVoidedInvs,
       }
@@ -16598,7 +16638,7 @@ function DailyNotifCard({ S, T = {}, shopName, showToast, customers = [], invoic
       return s;
     }, 0);
     const _voidedIds2   = new Set((invoices||[]).filter(i=>i.status==="voided").map(i=>i.id));
-    const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && !_voidedIds2.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
+    const bakiToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "baki" && t.invoiceId && !_voidedIds2.has(t.invoiceId)).reduce((s, t) => s + t.amount, 0);
     const jomaToday     = (txns || []).filter(t => t.dateKey === todayKey && t.type === "joma" && t.source !== "partial-sale" && t.source !== "void-reversal").reduce((s, t) => s + t.amount, 0);
     const totalBakiNow  = (customers || []).reduce((s, c) => s + (c.balance || 0), 0);
     // 🟢 আজকের লাভ ও 🔴 আজকের লস — invoice-level আলাদা করে হিসাব (একই পণ্যের ভিন্ন ইনভয়েস cancel হবে না)
