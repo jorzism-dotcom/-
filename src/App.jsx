@@ -3543,6 +3543,7 @@ const FSS = {
     this._app = null;
     this._db = null;
     this._cfg = null;
+    this._persistTried = false; // Fix: নতুন config-এ persistentLocalCache সঠিকভাবে apply হবে
   },
 
   // একটা collection-এর সব ডকুমেন্ট রিয়েল-টাইমে শোনে — যেকোনো ফোনে কোনো রেকর্ড
@@ -8149,7 +8150,7 @@ function SmartBusinessMgmt() {
           // Staff: Firestore থেকে পাওয়া Admin token ব্যবহার করো
           // expiry window ৫৮ মিনিট — Admin প্রতি ৪৫ মিনিটে refresh করে তাই overlap থাকে
           const tk = googleDriveToken;
-          const fresh = tk?.token && tk?.savedAt && (Date.now() - tk.savedAt) < 68 * 60 * 1000;
+          const fresh = tk?.token && tk?.savedAt && (Date.now() - tk.savedAt) < 59 * 60 * 1000; // Fix: 60min expiry-র আগে 59min — expired token দিয়ে upload হবে না
           token = fresh ? tk.token : null;
         }
         if (!token) return; // token নেই/expired — এই cycle skip, পরের cycle-এ আবার চেষ্টা
@@ -8286,8 +8287,8 @@ function SmartBusinessMgmt() {
             if (c.id !== inv.customerId) return c;
             const currentBal = c.balance || 0;
             const newBal = Math.max(0, currentBal - netChange);
-            // addTxn inside setCustomers updater won't work — use setTimeout to fire after state commits
-            setTimeout(() => {
+            // addTxn inside setCustomers updater won't work — use safeTimeout (unmount-safe) to fire after state commits
+            safeTimeout(() => {
               addTxn(
                 inv.customerId, netChange > 0 ? "joma" : "baki", Math.abs(netChange), newBal,
                 inv.id,
@@ -8313,7 +8314,7 @@ function SmartBusinessMgmt() {
                     : inv.payType === "partial" ? (inv.bakiAmount || 0) : 0;
       FSS.updateStats(inv.dateKey, { sale: -saleAmt, cash: -cashAmt, baki: -bakiAmt, profit: 0 });
     }
-  }, [setInvoices, setCustomers, setProducts, addTxn, showToast]);
+  }, [setInvoices, setCustomers, setProducts, addTxn, showToast, safeTimeout]);
 
   const connectBluetooth = useCallback(async () => {
     await BT.init();
@@ -20768,8 +20769,15 @@ function validateBackup(data) {
 
 // ─── Google Drive API Helper ──────────────────────────────────────────────────
 const GDrive = {
-  BACKUP_FILENAME: "sbm-backup.json",
+  BACKUP_FILENAME: "sbm-backup.json", // downloadBackup/deleteBackup legacy fallback
   FOLDER_NAME: "SBM Backups",
+  MAX_BACKUPS: 7, // Drive-এ সর্বোচ্চ ৭টা date-based backup রাখা হবে
+
+  // আজকের date-based filename: sbm-backup-2026-06-26.json(.gz)
+  _todayFilename(compressed = false) {
+    const d = new Date().toISOString().split("T")[0];
+    return compressed ? `sbm-backup-${d}.json.gz` : `sbm-backup-${d}.json`;
+  },
 
   async getToken() {
     return localStorage.getItem("sbm_gd_token") || null;
@@ -20998,19 +21006,20 @@ const GDrive = {
     // ── "SBM Backups" folder খুঁজো বা তৈরি করো (visible, Drive অ্যাপে দেখা যাবে)
     const folderId = await this._ensureFolder(token);
 
+    // Fix: date-based filename — প্রতিদিন আলাদা ফাইল, পুরনোটা overwrite হয় না
+    const todayName = this._todayFilename(compressed);
     const meta = JSON.stringify({
-      name: compressed ? this.BACKUP_FILENAME + ".gz" : this.BACKUP_FILENAME,
+      name: todayName,
       parents: [folderId],
       description: `SBM Backup — ${new Date().toLocaleString("en-US")} | ${compressed ? `gzip ${(compressedBytes/1024).toFixed(0)}KB←${(originalBytes/1024).toFixed(0)}KB` : `json ${(originalBytes/1024).toFixed(0)}KB`}`,
-      appProperties: { hg_compressed: compressed ? "gzip" : "none", hg_version: "4.1" },
+      appProperties: { hg_compressed: compressed ? "gzip" : "none", hg_version: "4.2" },
     });
 
-    // Search for EITHER filename (gz or plain) so we update the right file
-    const existing = await this.findBackupFile(token);
-
+    // আজকের ফাইল Drive-এ আছে কিনা দেখো — থাকলে update, না থাকলে নতুন তৈরি করো
+    const existingToday = await this._findFileByName(token, folderId, todayName);
     let url, method;
-    if (existing) {
-      url = `https://www.googleapis.com/upload/drive/v3/files/${existing}?uploadType=multipart`;
+    if (existingToday) {
+      url = `https://www.googleapis.com/upload/drive/v3/files/${existingToday}?uploadType=multipart`;
       method = "PATCH";
     } else {
       url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
@@ -21032,14 +21041,64 @@ const GDrive = {
       throw new Error(err.error?.message || `HTTP ${r.status}`);
     }
     const result = await r.json();
+
+    // Fix: পুরনো backup ছাঁটো — MAX_BACKUPS (৭টা) এর বেশি হলে সবচেয়ে পুরনোটা delete করো
+    try { await this._pruneOldBackups(token, folderId); } catch { /* prune failure upload block করবে না */ }
+
     return { ...result, _compressed: compressed, _originalBytes: originalBytes, _compressedBytes: compressedBytes };
   },
 
+  // ── নির্দিষ্ট নামের ফাইল folder-এ খুঁজো ──────────────────────────────────
+  async _findFileByName(token, folderId, filename) {
+    const q = encodeURIComponent(`name="${filename}" and "${folderId}" in parents and trashed=false`);
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    ).catch(() => null);
+    if (!r?.ok) return null;
+    const data = await r.json().catch(() => ({}));
+    return data.files?.[0]?.id || null;
+  },
+
+  // ── পুরনো backup ছাঁটো — MAX_BACKUPS-এর বেশি হলে সবচেয়ে পুরনোটা delete ──
+  async _pruneOldBackups(token, folderId) {
+    // sbm-backup-YYYY-MM-DD.json(.gz) pattern-এর সব ফাইল খুঁজো
+    const q = encodeURIComponent(`name contains "sbm-backup-" and "${folderId}" in parents and trashed=false`);
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=20`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!r.ok) return;
+    const data = await r.json();
+    const files = data.files || [];
+    if (files.length <= this.MAX_BACKUPS) return; // ৭টা বা কম — delete দরকার নেই
+    // সবচেয়ে পুরনোগুলো (MAX_BACKUPS এর পর যা আছে) delete করো
+    const toDelete = files.slice(this.MAX_BACKUPS);
+    await Promise.allSettled(toDelete.map(f =>
+      fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    ));
+  },
+
   // ── "SBM Backups" folder খুঁজো — না থাকলে তৈরি করো
+  // Fix: cached folder ID যদি Drive-এ আর না থাকে (deleted/account change) → cache clear করে retry
   async _ensureFolder(token) {
-    // Cache করা folder ID আছে?
     const cached = localStorage.getItem("sbm_gd_folder_id");
-    if (cached) return cached;
+    if (cached) {
+      // cached ID valid কিনা verify করো
+      const check = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${cached}?fields=id,trashed`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      ).catch(() => null);
+      if (check?.ok) {
+        const info = await check.json().catch(() => ({}));
+        if (info.id && !info.trashed) return cached; // valid — ব্যবহার করো
+      }
+      // stale cache — clear করে নতুন করে খোঁজো
+      localStorage.removeItem("sbm_gd_folder_id");
+    }
 
     // Drive-এ "SBM Backups" folder আছে কিনা খোঁজো
     const q = encodeURIComponent(`name="${this.FOLDER_NAME}" and mimeType="application/vnd.google-apps.folder" and trashed=false`);
@@ -21074,17 +21133,29 @@ const GDrive = {
 
   async findBackupFile(token) {
     const folderId = await this._ensureFolder(token);
-    const names = [this.BACKUP_FILENAME + ".gz", this.BACKUP_FILENAME];
-    for (const name of names) {
-      const q = encodeURIComponent(`name="${name}" and "${folderId}" in parents and trashed=false`);
-      const r = await fetch(
-        `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!r.ok) continue;
+    // Fix: date-based file খুঁজো (sbm-backup-YYYY-MM-DD.*) — সবচেয়ে নতুনটা আগে
+    const q = encodeURIComponent(`name contains "sbm-backup-" and "${folderId}" in parents and trashed=false`);
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=1`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (r.ok) {
       const data = await r.json();
       const id = data.files?.[0]?.id;
       if (id) return id;
+    }
+    // Legacy fallback: পুরনো fixed-name backup (migration compatibility)
+    const legacyNames = [this.BACKUP_FILENAME + ".gz", this.BACKUP_FILENAME];
+    for (const name of legacyNames) {
+      const q2 = encodeURIComponent(`name="${name}" and "${folderId}" in parents and trashed=false`);
+      const r2 = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${q2}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!r2.ok) continue;
+      const data2 = await r2.json();
+      const id2 = data2.files?.[0]?.id;
+      if (id2) return id2;
     }
     return null;
   },
@@ -21182,7 +21253,7 @@ const GDrive = {
 const SnapshotDB = {
   DB_NAME: "hg_snapshots",
   STORE:   "snapshots",
-  MAX:     3, // rotating: snapshot_1, snapshot_2, snapshot_3
+  MAX:     7, // rotating: snapshot_1 … snapshot_7 — ৭ ঘণ্টার ইতিহাস
 
   _db: null,
 
