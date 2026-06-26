@@ -3555,8 +3555,10 @@ const FSS = {
     // includeMetadataChanges:true — offline-এ save হওয়া (hasPendingWrites:true) records
     // সহ আসে। অনলাইনে আসার পর replace হওয়ার আগেই দেখা যাবে — data হারাবে না।
     const unsub = onSnapshot(colRef, { includeMetadataChanges: true }, (snap) => {
-      const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      callback(arr);
+      // raw: tombstone সহ (LWW merge-এর জন্য), filtered: _deleted বাদ (normal use)
+      const raw      = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const arr      = raw.filter(r => !r._deleted);
+      callback(arr, raw);
     }, () => { /* offline/error — Firestore নিজেই retry করবে, cache থেকে কাজ চলবে */ });
     this._unsubs[name] = unsub;
     return unsub;
@@ -3592,14 +3594,15 @@ const FSS = {
       const CHUNK = 400;
       const ops = [
         ...sets.map(([id, data]) => ({ type: "set", id, data })),
-        ...deletes.map((id) => ({ type: "delete", id })),
+        // delete → tombstone: _deleted:true + _updatedAt (LWW conflict resolution)
+        ...deletes.map((id) => ({ type: "set", id, data: { _deleted: true, _updatedAt: Date.now() } })),
       ];
       for (let i = 0; i < ops.length; i += CHUNK) {
         const batch = writeBatch(this._db);
         ops.slice(i, i + CHUNK).forEach((op) => {
           const ref = doc(this._db, coll, String(op.id));
-          if (op.type === "set") batch.set(ref, op.data);
-          else batch.delete(ref);
+          if (op.type === "set") batch.set(ref, op.data, { merge: true });
+          else batch.delete(ref); // fallback (আসলে আর পৌঁছাবে না)
         });
         await batch.commit();
       }
@@ -3609,11 +3612,14 @@ const FSS = {
     }
   },
 
-  // রেকর্ড মুছে ফেলো (write পরিবর্তন: deleteDoc = delete)
+  // রেকর্ড মুছে ফেলো — Tombstone pattern (deleteDoc নয়):
+  // _deleted:true + _updatedAt সেট করে, document রেখে দাও।
+  // এতে offline delete ও online edit conflict-এ LWW সঠিকভাবে কাজ করে।
+  // subscribeCollection-এ _deleted:true records filter হয়ে যায়।
   async deleteRecord(coll, id) {
     if (!this._db || id === undefined || id === null || id === "") return { ok: false, msg: "Firestore সংযুক্ত নেই" };
     try {
-      await deleteDoc(doc(this._db, coll, String(id)));
+      await setDoc(doc(this._db, coll, String(id)), { _deleted: true, _updatedAt: Date.now() }, { merge: true });
       return { ok: true };
     } catch (e) {
       return { ok: false, msg: e.message || "Firestore delete ব্যর্থ" };
@@ -3739,16 +3745,63 @@ function useFSSCollection(name, value, setValue, ready, opts = {}) {
   useEffect(() => {
     if (!ready) { firstRemote.current = false; return; }
     firstRemote.current = false;
-    const unsub = FSS.subscribeCollection(name, (arr) => {
+    const unsub = FSS.subscribeCollection(name, (arr, rawArr) => {
       const incoming = filterIncoming ? filterIncoming(arr) : arr;
       if (!firstRemote.current) {
         firstRemote.current = true;
-        if (arr.length === 0 && valueRef.current?.length) {
-          // নতুন/খালি collection — এই ডিভাইসের বর্তমান data দিয়ে seed করি
-          lastSynced.current = valueRef.current;
-          valueRef.current.forEach(rec => { if (rec?.id != null) FSS.setRecord(name, rec.id, rec); });
-          return;
+        const localArr = valueRef.current || [];
+
+        // ── First-snapshot LWW (Last Write Wins) + Tombstone merge ───────────
+        // rawArr: Firestore-এর সব records (_deleted tombstone সহ)
+        // incoming: _deleted filter করা (display-এর জন্য)
+        //
+        // Scenario A: remote-এ নেই → local push
+        // Scenario B: উভয়ে আছে → _updatedAt বেশি যার, সে জেতে
+        // Scenario C: remote tombstone (_deleted:true) →
+        //   tombstone নতুন → delete জেতে (local থেকেও বাদ)
+        //   local নতুন → local edit জেতে (tombstone override, push)
+        // ─────────────────────────────────────────────────────────────────────
+        const rawMap   = new Map((rawArr || []).map(r => [String(r.id), r]));
+        const localMap = new Map(localArr.map(r => [String(r.id), r]));
+        const toPush   = [];
+        const merged   = new Map(incoming.map(r => [String(r.id), r]));
+
+        localMap.forEach((localRec, id) => {
+          if (localRec?.id == null) return;
+          const rawRec = rawMap.get(id);
+
+          if (!rawRec) {
+            // remote-এ একদমই নেই → local জেতে
+            const rec = localRec._updatedAt ? localRec : withTs(localRec);
+            toPush.push([id, rec]);
+            merged.set(id, rec);
+          } else if (rawRec._deleted) {
+            // remote tombstone
+            if ((localRec._updatedAt || 0) > (rawRec._updatedAt || 0)) {
+              // local বেশি নতুন → edit জেতে, tombstone override
+              toPush.push([id, localRec]);
+              merged.set(id, localRec);
+            }
+            // else: tombstone জেতে → merged-এ নেই, local থেকেও বাদ
+          } else if ((localRec._updatedAt || 0) > (rawRec._updatedAt || 0)) {
+            // উভয়ে আছে, local বেশি নতুন
+            toPush.push([id, localRec]);
+            merged.set(id, localRec);
+          }
+          // else: remote বেশি নতুন বা সমান → remote জেতে
+        });
+
+        if (toPush.length === 1) {
+          FSS.setRecord(name, toPush[0][0], toPush[0][1]);
+        } else if (toPush.length > 1) {
+          FSS.commitBatch(name, toPush, []);
         }
+
+        const mergedArr = Array.from(merged.values());
+        lastSynced.current = mergedArr;
+        setValue(mergedArr);
+        if (onSync) { onSync("syncing"); setTimeout(() => onSync("synced"), 0); setTimeout(() => onSync(null), 1500); }
+        return;
       }
       lastSynced.current = incoming;
       setValue(incoming);
